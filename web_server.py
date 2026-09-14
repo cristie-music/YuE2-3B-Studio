@@ -58,7 +58,7 @@ except ImportError:
     m21_converter = None
 
 # -------------------------------------------------------------
-# 2. Оптимизация памяти NAR под 16GB VRAM
+# 2. Оптимизация памяти NAR под 16GB VRAM и безопасный FAST-патчинг
 # -------------------------------------------------------------
 ORIG_CACHED_NAR_INIT = yue_nar.CachedNAR.__init__
 
@@ -66,6 +66,34 @@ def patched_cached_nar_init(self, model, chunk, attention, query_chunk_size=None
     return ORIG_CACHED_NAR_INIT(self, model, chunk, attention, query_chunk_size=512, *args, **kwargs)
 
 yue_nar.CachedNAR.__init__ = patched_cached_nar_init
+
+# Глобальный флаг текущего режима FAST (меняется воркером без перезаписи функций)
+CURRENT_TASK_IS_FAST = True
+
+# Патч для RecursionError
+ORIGINAL_NAR_SYNTHESIZE = yue_nar.synthesize
+def safe_fast_synthesize(*args, **kwargs):
+    if CURRENT_TASK_IS_FAST:
+        if "steps" in kwargs:
+            kwargs["steps"] = 16
+        elif len(args) >= 6:
+            args_list = list(args)
+            args_list[5] = 16
+            args = tuple(args_list)
+    return ORIGINAL_NAR_SYNTHESIZE(*args, **kwargs)
+
+yue_nar.synthesize = safe_fast_synthesize
+
+ORIGINAL_SAMPLING_GENERATE = yue_sampling.generate_tokens
+def safe_fast_generate_tokens(model, prefix, sampling, seed, phase, *args, **kwargs):
+    if CURRENT_TASK_IS_FAST and phase == "song":
+        if hasattr(sampling, "max_tokens"):
+            sampling.max_tokens = min(sampling.max_tokens, 3200)
+        elif hasattr(sampling, "max_length"):
+            sampling.max_length = min(sampling.max_length, 3200)
+    return ORIGINAL_SAMPLING_GENERATE(model, prefix, sampling, seed, phase, *args, **kwargs)
+
+yue_sampling.generate_tokens = safe_fast_generate_tokens
 
 task_queue = queue.Queue()
 current_task = {
@@ -176,6 +204,29 @@ def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+def sanitize_abc_notation(raw_abc: str, title: str = "YuE2 Track") -> str:
+    """Очищает ABC-партитуру от специфических метатегов MIDI, приводя ее к чистому стандарту YuE2."""
+    clean_lines = []
+    has_header = False
+    for line in raw_abc.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("X:"):
+            has_header = True
+            clean_lines.append("X:1")
+        elif line.startswith("T:"):
+            clean_lines.append(f"T:{title}")
+        elif line.startswith(("M:", "L:", "Q:", "K:", "V:")):
+            clean_lines.append(line)
+        elif not line.startswith("%") and not line.startswith("w:"):
+            clean_lines.append(line)
+
+    if not has_header:
+        header = ["X:1", f"T:{title}", "M:4/4", "L:1/8", "K:C", "V:1"]
+        return "\n".join(header + clean_lines)
+    return "\n".join(clean_lines)
+
 def generate_fallback_abc(title, style, lyrics):
     bpm = 120
     for token in style.split(","):
@@ -192,8 +243,7 @@ def generate_fallback_abc(title, style, lyrics):
         "L:1/8",
         f"Q:1/4={bpm}",
         "K:C",
-        "%%MIDI program 0",
-        "V:1 name=\"Lead Vocal\"",
+        "V:1 name=\"Lead\"",
         "|: [CEG]4 [DFA]4 | [EGB]4 [CEG]4 :|"
     ]
     return "\n".join(abc_lines)
@@ -202,7 +252,7 @@ def generate_fallback_abc(title, style, lyrics):
 # 5. Фоновый воркер инференса
 # -------------------------------------------------------------
 def generation_worker():
-    global current_task
+    global current_task, CURRENT_TASK_IS_FAST
     while True:
         task = task_queue.get()
         if task is None:
@@ -214,33 +264,11 @@ def generation_worker():
         current_task["progress_msg"] = "Подготовка параметров генерации..."
         current_task["error"] = None
 
+        CURRENT_TASK_IS_FAST = task.get("fast_mode", True)
         start_time = time.time()
 
         try:
             pipe = get_pipeline()
-            is_fast = task.get("fast_mode", True)
-
-            if is_fast:
-                ORIG_SYNTHESIZE_FN = yue_nar.synthesize
-                def fast_synthesize_fn(*args, **kwargs):
-                    if "steps" in kwargs:
-                        kwargs["steps"] = 16
-                    elif len(args) >= 6:
-                        args_list = list(args)
-                        args_list[5] = 16
-                        args = tuple(args_list)
-                    return ORIG_SYNTHESIZE_FN(*args, **kwargs)
-                yue_nar.synthesize = fast_synthesize_fn
-
-                ORIG_GENERATE_TOKENS = yue_sampling.generate_tokens
-                def fast_generate_tokens(model, prefix, sampling, seed, phase, *args, **kwargs):
-                    if phase == "song":
-                        if hasattr(sampling, "max_tokens"):
-                            sampling.max_tokens = min(sampling.max_tokens, 3200)
-                        elif hasattr(sampling, "max_length"):
-                            sampling.max_length = min(sampling.max_length, 3200)
-                    return ORIG_GENERATE_TOKENS(model, prefix, sampling, seed, phase, *args, **kwargs)
-                yue_sampling.generate_tokens = fast_generate_tokens
 
             style = task["style"]
             if task.get("is_instrumental", False):
@@ -264,13 +292,14 @@ def generation_worker():
 
             if custom_abc:
                 current_task["progress_msg"] = "Синтез по партитуре (MIDI/ABC)..."
-                gen_kwargs["abc"] = custom_abc
-                gen_kwargs["cot"] = task.get("cot", "full")
+                gen_kwargs["abc"] = sanitize_abc_notation(custom_abc, task.get("title") or "Track")
+                gen_kwargs["cot"] = "melody"
             else:
                 chosen_cot = "melody" if audio_file else task.get("cot", "full")
                 current_task["progress_msg"] = f"Символическое планирование (cot='{chosen_cot}')..."
                 gen_kwargs["cot"] = chosen_cot
 
+            # Безопасный вызов генерации
             song = pipe(**gen_kwargs)
 
             current_task["progress_msg"] = "Сохранение аудио и нотных артефактов..."
@@ -287,6 +316,7 @@ def generation_worker():
                     audio_data = audio_data.T
                 sf.write(str(file_path), audio_data, 48000)
 
+            # Сохранение партитуры ABC
             track_artifacts_dir = ARTIFACTS_BASE_DIR / task_id
             track_artifacts_dir.mkdir(parents=True, exist_ok=True)
             target_score_file = track_artifacts_dir / "score.abc"
@@ -326,7 +356,7 @@ def generation_worker():
                 "cot": gen_kwargs["cot"],
                 "cfg_scale": task.get("cfg_scale", 1.2),
                 "seed": task.get("seed", 42),
-                "fast_mode": is_fast,
+                "fast_mode": CURRENT_TASK_IS_FAST,
                 "is_instrumental": task.get("is_instrumental", False),
                 "reference_audio": audio_file,
                 "has_abc": True,
@@ -435,7 +465,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
                     score_file = found[0]
 
             if score_file.exists():
-                abc_content = score_file.read_text(encoding="utf-8")
+                abc_content = score_file.read_text(encoding="utf-8", errors="ignore")
             else:
                 history = load_history()
                 item = next((x for x in history if x["id"] == track_id), None)
@@ -587,7 +617,8 @@ class StudioHandler(SimpleHTTPRequestHandler):
                     tmp_abc_path = UPLOADS_DIR / f"{saved_filename}.abc"
                     midi_score.write("abc", fp=str(tmp_abc_path))
                     if tmp_abc_path.exists():
-                        abc_content = tmp_abc_path.read_text(encoding="utf-8", errors="ignore")
+                        raw_abc = tmp_abc_path.read_text(encoding="utf-8", errors="ignore")
+                        abc_content = sanitize_abc_notation(raw_abc, saved_filename)
                         tmp_abc_path.unlink()
                 except Exception as e:
                     print(f"[Ошибка конвертации MIDI в ABC]: {e}")
@@ -613,7 +644,6 @@ class StudioHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/tracks/delete":
             track_id = data.get("id")
             history = load_history()
-            
             track_item = next((t for t in history if t["id"] == track_id), None)
             if track_item:
                 filename = track_item.get("filename")
@@ -624,14 +654,12 @@ class StudioHandler(SimpleHTTPRequestHandler):
                             flac_path.unlink()
                         except Exception:
                             pass
-                
                 art_dir = ARTIFACTS_BASE_DIR / track_id
                 if art_dir.exists():
                     try:
                         shutil.rmtree(art_dir)
                     except Exception:
                         pass
-                
                 history = [t for t in history if t["id"] != track_id]
                 save_history(history)
 
