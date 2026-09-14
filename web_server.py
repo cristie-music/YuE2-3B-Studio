@@ -37,10 +37,16 @@ os.environ["YUE_DISABLE_CUDA_GRAPH"] = "1"
 import torch
 import soundfile as sf
 
+# Определение доступного вычислительного бэкенда
 if torch.cuda.is_available():
+    device = "cuda"
     torch.backends.cuda.enable_flash_sdp(False)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(True)
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+else:
+    device = "cpu"
 
 from yue2 import YuE2Pipeline
 import yue2.nar as yue_nar
@@ -77,17 +83,20 @@ GLOBAL_PIPE = None
 def get_pipeline():
     global GLOBAL_PIPE
     if GLOBAL_PIPE is None:
-        current_task["progress_msg"] = "Загрузка весов модели YuE2-3B в GPU..."
+        current_task["progress_msg"] = f"Загрузка весов YuE2-3B в память ({device.upper()})..."
         GLOBAL_PIPE = YuE2Pipeline.from_pretrained(
             "m-a-p/YuE2-3B",
             vae="m-a-p/YuE2-Vae",
-            device="cuda",
+            device=device,
             backend="torch-eager",
             cache_dir=str(MODELS_CACHE_DIR)
         )
         orig_synth = GLOBAL_PIPE.synthesize
         def safe_synth(*args, **kwargs):
-            torch.cuda.empty_cache()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            elif device == "mps":
+                torch.mps.empty_cache()
             gc.collect()
             return orig_synth(*args, **kwargs)
         GLOBAL_PIPE.synthesize = safe_synth
@@ -338,7 +347,10 @@ def generation_worker():
             current_task["error"] = str(e)
             current_task["progress_msg"] = f"Ошибка: {str(e)}"
         finally:
-            torch.cuda.empty_cache()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            elif device == "mps":
+                torch.mps.empty_cache()
             gc.collect()
             task_queue.task_done()
 
@@ -568,12 +580,10 @@ class StudioHandler(SimpleHTTPRequestHandler):
                     f.write(raw_data)
                 is_midi = False
 
-            # Если загружен MIDI, сразу конвертируем его в ABC-нотацию
             abc_content = ""
             if is_midi and m21_converter is not None:
                 try:
                     midi_score = m21_converter.parse(str(saved_path), format="midi")
-                    # Экспортируем в формат ABC через временный файл
                     tmp_abc_path = UPLOADS_DIR / f"{saved_filename}.abc"
                     midi_score.write("abc", fp=str(tmp_abc_path))
                     if tmp_abc_path.exists():
@@ -766,7 +776,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
 def run_server(port=7860):
     server = HTTPServer(("127.0.0.1", port), StudioHandler)
     print("=" * 65)
-    print(" YuE2-3B Studio Server запущен!")
+    print(f" YuE2-3B Studio Server запущен на бэкенде: {device.upper()}")
     print(f" Доступ в браузере: http://127.0.0.1:{port}")
     print("=" * 65)
     server.serve_forever()
