@@ -21,6 +21,8 @@ ARTIFACTS_BASE_DIR = BASE_DIR / "outputs" / "artifacts"
 ARTIFACTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+LORAS_DIR = BASE_DIR / "loras"
+LORAS_DIR.mkdir(parents=True, exist_ok=True)
 
 HISTORY_FILE = BASE_DIR / "history.json"
 PROFILE_FILE = BASE_DIR / "profile.json"
@@ -57,6 +59,11 @@ try:
 except ImportError:
     m21_converter = None
 
+try:
+    from peft import PeftModel
+except ImportError:
+    PeftModel = None
+
 # -------------------------------------------------------------
 # 2. Оптимизация памяти NAR под 16GB VRAM и безопасный FAST-патчинг
 # -------------------------------------------------------------
@@ -67,10 +74,8 @@ def patched_cached_nar_init(self, model, chunk, attention, query_chunk_size=None
 
 yue_nar.CachedNAR.__init__ = patched_cached_nar_init
 
-# Глобальный флаг текущего режима FAST (меняется воркером без перезаписи функций)
 CURRENT_TASK_IS_FAST = True
 
-# Патч для RecursionError
 ORIGINAL_NAR_SYNTHESIZE = yue_nar.synthesize
 def safe_fast_synthesize(*args, **kwargs):
     if CURRENT_TASK_IS_FAST:
@@ -104,7 +109,7 @@ current_task = {
 }
 
 # -------------------------------------------------------------
-# 3. Синглтон пайплайна YuE2
+# 3. Синглтон пайплайна YuE2 и менеджер LoRA
 # -------------------------------------------------------------
 GLOBAL_PIPE = None
 
@@ -130,8 +135,39 @@ def get_pipeline():
         GLOBAL_PIPE.synthesize = safe_synth
     return GLOBAL_PIPE
 
+def apply_lora(pipe, lora_filename, scale=1.0):
+    """Подключает LoRA к пайплайну YuE2"""
+    if not lora_filename:
+        return False
+    lora_path = LORAS_DIR / lora_filename
+    if not lora_path.exists():
+        return False
+    
+    try:
+        if hasattr(pipe, "load_lora_weights"):
+            pipe.load_lora_weights(str(lora_path), adapter_name="custom_lora")
+            if hasattr(pipe, "set_adapters"):
+                pipe.set_adapters(["custom_lora"], adapter_weights=[float(scale)])
+            return True
+        elif hasattr(pipe, "model") and PeftModel is not None:
+            pipe.model = PeftModel.from_pretrained(pipe.model, str(lora_path), adapter_name="custom_lora")
+            return True
+    except Exception as e:
+        print(f"[LoRA Warning] Не удалось загрузить {lora_filename}: {e}")
+    return False
+
+def remove_lora(pipe):
+    """Выгружает LoRA и восстанавливает базовую модель"""
+    try:
+        if hasattr(pipe, "unload_lora_weights"):
+            pipe.unload_lora_weights()
+        elif hasattr(pipe, "delete_adapter"):
+            pipe.delete_adapter("custom_lora")
+    except Exception:
+        pass
+
 # -------------------------------------------------------------
-# 4. База данных JSON
+# 4. База данных JSON и файлы LoRA
 # -------------------------------------------------------------
 DEFAULT_PRESETS = [
     {
@@ -204,8 +240,19 @@ def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
+def list_available_loras():
+    loras = []
+    for file in LORAS_DIR.glob("*.*"):
+        if file.suffix.lower() in [".safetensors", ".bin", ".pt"]:
+            size_mb = round(file.stat().st_size / (1024 * 1024), 1)
+            loras.append({
+                "filename": file.name,
+                "name": file.stem.replace("_", " ").title(),
+                "size": f"{size_mb} MB"
+            })
+    return loras
+
 def sanitize_abc_notation(raw_abc: str, title: str = "YuE2 Track") -> str:
-    """Очищает ABC-партитуру от специфических метатегов MIDI, приводя ее к чистому стандарту YuE2."""
     clean_lines = []
     has_header = False
     for line in raw_abc.splitlines():
@@ -266,9 +313,18 @@ def generation_worker():
 
         CURRENT_TASK_IS_FAST = task.get("fast_mode", True)
         start_time = time.time()
+        pipe = None
+        lora_loaded = False
 
         try:
             pipe = get_pipeline()
+
+            # Применение LoRA если выбрана
+            lora_file = task.get("lora_file")
+            lora_scale = float(task.get("lora_scale", 0.8))
+            if lora_file:
+                current_task["progress_msg"] = f"Подключение адаптера LoRA ({lora_file})..."
+                lora_loaded = apply_lora(pipe, lora_file, lora_scale)
 
             style = task["style"]
             if task.get("is_instrumental", False):
@@ -299,7 +355,6 @@ def generation_worker():
                 current_task["progress_msg"] = f"Символическое планирование (cot='{chosen_cot}')..."
                 gen_kwargs["cot"] = chosen_cot
 
-            # Безопасный вызов генерации
             song = pipe(**gen_kwargs)
 
             current_task["progress_msg"] = "Сохранение аудио и нотных артефактов..."
@@ -316,7 +371,6 @@ def generation_worker():
                     audio_data = audio_data.T
                 sf.write(str(file_path), audio_data, 48000)
 
-            # Сохранение партитуры ABC
             track_artifacts_dir = ARTIFACTS_BASE_DIR / task_id
             track_artifacts_dir.mkdir(parents=True, exist_ok=True)
             target_score_file = track_artifacts_dir / "score.abc"
@@ -359,6 +413,8 @@ def generation_worker():
                 "fast_mode": CURRENT_TASK_IS_FAST,
                 "is_instrumental": task.get("is_instrumental", False),
                 "reference_audio": audio_file,
+                "lora": lora_file if lora_loaded else None,
+                "lora_scale": lora_scale if lora_loaded else None,
                 "has_abc": True,
                 "is_midi_gen": bool(task.get("midi_source", False)),
                 "filename": filename,
@@ -377,6 +433,8 @@ def generation_worker():
             current_task["error"] = str(e)
             current_task["progress_msg"] = f"Ошибка: {str(e)}"
         finally:
+            if pipe and lora_loaded:
+                remove_lora(pipe)
             if device == "cuda":
                 torch.cuda.empty_cache()
             elif device == "mps":
@@ -532,6 +590,13 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(midi_bytes)
             return
 
+        if parsed.path == "/api/loras":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps(list_available_loras()).encode("utf-8"))
+            return
+
         if parsed.path == "/api/status":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -576,7 +641,6 @@ class StudioHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         content_length = int(self.headers.get("Content-Length", 0))
 
-        # Загрузка аудио или MIDI файлов
         if parsed.path == "/api/upload":
             content_type = self.headers.get("Content-Type", "")
             raw_data = self.rfile.read(content_length)
@@ -667,6 +731,20 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+            return
+
+        if parsed.path == "/api/loras/delete":
+            lora_fn = data.get("filename")
+            target_path = LORAS_DIR / lora_fn
+            if target_path.exists():
+                try:
+                    target_path.unlink()
+                except Exception:
+                    pass
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"success": True, "loras": list_available_loras()}).encode("utf-8"))
             return
 
         if parsed.path == "/api/personas":
@@ -777,7 +855,9 @@ class StudioHandler(SimpleHTTPRequestHandler):
                 "is_instrumental": bool(data.get("is_instrumental", False)),
                 "audio_file": data.get("audio_file", None),
                 "abc_score": data.get("abc_score", ""),
-                "midi_source": bool(data.get("midi_source", False))
+                "midi_source": bool(data.get("midi_source", False)),
+                "lora_file": data.get("lora_file", None),
+                "lora_scale": float(data.get("lora_scale", 0.8))
             }
             task_queue.put(task_item)
 
@@ -805,6 +885,7 @@ def run_server(port=7860):
     server = HTTPServer(("127.0.0.1", port), StudioHandler)
     print("=" * 65)
     print(f" YuE2-3B Studio Server запущен на бэкенде: {device.upper()}")
+    print(f" Каталог адаптеров LoRA: {LORAS_DIR}")
     print(f" Доступ в браузере: http://127.0.0.1:{port}")
     print("=" * 65)
     server.serve_forever()

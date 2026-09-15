@@ -1,0 +1,1319 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YuE2-3B Studio</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            suno: {
+              DEFAULT: '#09090b',
+              sidebar: '#000000',
+              panel: '#121214',
+              card: '#18181b',
+              border: '#27272a'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+  </style>
+</head>
+<body class="bg-suno text-white overflow-hidden select-none">
+  
+  <div class="flex flex-col h-screen w-screen overflow-hidden">
+    
+    <!-- Верхняя рабочая область -->
+    <div class="flex-1 flex overflow-hidden">
+      
+      <!-- 1. Сайдбар -->
+      <aside class="w-[220px] bg-suno-sidebar border-r border-white/5 flex flex-col justify-between p-3 flex-shrink-0">
+        <div class="space-y-6">
+          <div class="flex items-center gap-3 px-2 pt-2">
+            <div class="w-10 h-10 rounded-full bg-gradient-to-br from-pink-500 to-purple-600 flex items-center justify-center shadow-lg font-bold text-lg">
+              YuE
+            </div>
+            <div>
+              <div class="text-sm font-bold leading-tight">YuE2 Studio</div>
+              <div class="text-[10px] text-zinc-500">3B • VAE 48kHz</div>
+            </div>
+          </div>
+
+          <nav class="space-y-1.5">
+            <button class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 bg-white/10 text-white text-sm font-medium transition-colors">
+              <svg class="w-5 h-5 text-pink-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-width="2"/><circle cx="12" cy="12" r="2" stroke-width="2"/></svg>
+              Создать трек
+            </button>
+            <button onclick="openPresetsModal()" class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 text-zinc-400 hover:text-white hover:bg-white/5 text-sm font-medium transition-colors">
+              <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+              Пресеты стилей
+            </button>
+            <button onclick="openPersonasModal()" class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 text-zinc-400 hover:text-white hover:bg-white/5 text-sm font-medium transition-colors">
+              <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
+              Persona / Голоса
+            </button>
+            <button onclick="openLorasModal()" class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 text-zinc-400 hover:text-white hover:bg-white/5 text-sm font-medium transition-colors">
+              <svg class="w-5 h-5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+              LoRA Адаптеры
+            </button>
+          </nav>
+        </div>
+
+        <div class="space-y-3">
+          <div class="p-3 rounded-xl bg-zinc-900/50 text-[11px] space-y-1.5 border border-white/5 font-mono">
+            <div class="flex justify-between text-zinc-400">
+              <span>GPU</span><span class="text-green-400">RTX 4060 Ti</span>
+            </div>
+            <div class="flex justify-between text-zinc-400">
+              <span>VRAM Limit</span><span>16 GB</span>
+            </div>
+            <div class="flex justify-between text-zinc-400">
+              <span>Chunk NAR</span><span class="text-pink-400">512 tokens</span>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between p-2 rounded-xl bg-white/5 border border-white/5">
+            <div class="flex items-center gap-2 overflow-hidden">
+              <div id="profileAvatar" class="w-7 h-7 rounded-full bg-gradient-to-br from-pink-500 to-purple-600 flex items-center justify-center font-bold text-xs">C</div>
+              <span id="profileNameDisplay" class="text-xs font-medium truncate">cristie</span>
+            </div>
+            <button onclick="editProfileName()" class="text-zinc-400 hover:text-white p-1 text-xs" title="Сменить имя">✎</button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- 2. Панель параметров генерации -->
+      <section class="w-[440px] bg-suno-panel border-r border-white/5 flex flex-col flex-shrink-0 h-full overflow-y-auto">
+        <div class="p-4 pb-12 space-y-4">
+          
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold text-zinc-400 uppercase tracking-wider">Панель управления</span>
+            <span class="text-[10px] bg-green-500/10 text-green-400 border border-green-500/20 px-2 py-0.5 rounded-full font-mono">READY</span>
+          </div>
+
+          <!-- Выбор Persona -->
+          <div class="bg-suno-card rounded-xl border border-white/5 p-2.5 flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <span class="w-2 h-2 rounded-full bg-blue-400"></span>
+              <span class="text-xs font-bold text-zinc-400 uppercase">Persona:</span>
+            </div>
+            <select id="selectPersona" onchange="applySelectedPersona()" class="bg-zinc-900 border border-white/10 rounded-lg px-2 py-1 text-xs text-white outline-none max-w-[240px]">
+              <option value="">Без фиксации (Random)</option>
+            </select>
+          </div>
+
+          <!-- Выбор LoRA Адаптера -->
+          <div class="bg-suno-card rounded-xl border border-amber-500/20 bg-amber-500/5 p-2.5 space-y-2">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-amber-400"></span>
+                <span class="text-xs font-bold text-amber-300 uppercase">LoRA Адаптер:</span>
+              </div>
+              <button onclick="loadLorasList()" class="text-[10px] text-zinc-400 hover:text-white" title="Обновить список">↻ Обновить</button>
+            </div>
+            
+            <div class="flex items-center gap-2">
+              <select id="selectLora" onchange="toggleLoraScale()" class="flex-1 bg-zinc-900 border border-white/10 rounded-lg px-2 py-1 text-xs text-white outline-none">
+                <option value="">Не использовать LoRA</option>
+              </select>
+            </div>
+
+            <div id="loraScaleBox" class="hidden flex items-center justify-between gap-2 pt-1 border-t border-white/5 text-[11px]">
+              <span class="text-zinc-400">Сила (Scale):</span>
+              <div class="flex items-center gap-2 flex-1 max-w-[160px]">
+                <input id="rangeLoraScale" type="range" min="0.1" max="1.5" step="0.05" value="0.8" oninput="document.getElementById('loraScaleVal').innerText = this.value" class="w-full accent-amber-400 h-1 bg-zinc-800 rounded-lg cursor-pointer">
+                <span id="loraScaleVal" class="font-mono text-amber-300 w-8 text-right">0.8</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Название трека -->
+          <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
+            <div class="px-3 py-2 text-[11px] font-bold text-zinc-400 border-b border-white/5 uppercase">Название трека</div>
+            <input id="inputTitle" type="text" placeholder="Введите название..." class="w-full bg-transparent px-3 py-2.5 text-sm outline-none placeholder-zinc-600">
+          </div>
+
+          <!-- Блок MIDI импорта -->
+          <div class="bg-suno-card rounded-xl border border-purple-500/20 bg-purple-500/5 overflow-hidden">
+            <div class="px-3 py-2 border-b border-purple-500/20 bg-purple-500/10 flex items-center justify-between">
+              <span class="text-[11px] font-bold text-purple-300 uppercase tracking-wide flex items-center gap-1.5">
+                <span>♫</span> Создать трек из MIDI
+              </span>
+              <input type="file" id="midiFileInput" accept=".mid,.midi" class="hidden" onchange="handleMidiUpload(event)">
+              <button type="button" onclick="document.getElementById('midiFileInput').click()" class="px-2.5 py-1 rounded text-[10px] bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/30 transition-colors flex items-center gap-1">
+                <span>↑</span> Выбрать .MID файл
+              </button>
+            </div>
+            <div id="midiUploadArea" class="px-3 py-2.5 text-center text-[10px] text-zinc-500">
+              MIDI не выбран (будет сгенерирована новая мелодия)
+            </div>
+          </div>
+
+          <!-- Референс кавера -->
+          <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
+            <div class="px-3 py-2 border-b border-white/5 bg-white/[0.02] flex items-center justify-between">
+              <span class="text-[11px] font-bold text-zinc-400 uppercase tracking-wide">Кавер / Референс аудио</span>
+              <input type="file" id="coverFileInput" accept="audio/*" class="hidden" onchange="handleAudioUpload(event)">
+              <button type="button" onclick="document.getElementById('coverFileInput').click()" class="px-2 py-0.5 rounded text-[10px] bg-white/5 text-pink-400 hover:bg-white/10 transition-colors flex items-center gap-1">
+                <span>↑</span> Выбрать MP3/WAV
+              </button>
+            </div>
+            <div id="coverUploadArea" class="px-3 py-2.5 text-center text-[10px] text-zinc-500">
+              Файл не выбран (генерация новой мелодии)
+            </div>
+          </div>
+
+          <!-- Стиль музыки + Пресеты -->
+          <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden relative">
+            <div class="px-3 py-2 text-[11px] font-bold text-zinc-400 border-b border-white/5 uppercase flex justify-between items-center">
+              <span>Стиль музыки</span>
+              <div class="flex items-center gap-2">
+                <button onclick="openCreatePresetModal()" class="text-[10px] text-zinc-400 hover:text-white transition-colors" title="Сохранить как пресет">+ Пресет</button>
+                <div class="relative">
+                  <button onclick="togglePresetDropdown()" class="text-[10px] text-pink-400 hover:underline flex items-center gap-1">
+                    <span>Пресеты</span>
+                    <span class="text-[8px]">▼</span>
+                  </button>
+                  <div id="presetDropdown" class="hidden absolute right-0 top-6 w-60 bg-zinc-900 border border-white/10 rounded-xl shadow-2xl z-30 overflow-hidden py-1">
+                    <div id="presetDropdownList" class="max-h-56 overflow-y-auto text-xs"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <textarea id="inputStyle" rows="3" class="w-full bg-transparent p-3 text-xs outline-none resize-none placeholder-zinc-600" placeholder="e.g. industrial metal, EDM, female vocal, progressive metal, 135 bpm"></textarea>
+          </div>
+
+          <!-- Текст песни / Инструментал -->
+          <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
+            <div class="flex items-center justify-between px-3 py-2.5 border-b border-white/5 bg-white/[0.02]">
+              <span class="text-[11px] font-bold text-zinc-400 uppercase">Текст песни</span>
+              <label class="flex items-center gap-2 cursor-pointer">
+                <span class="text-[11px] text-zinc-400">Инструментал</span>
+                <input id="checkInstrumental" type="checkbox" onchange="toggleInstrumental()" class="accent-pink-500 w-4 h-4 cursor-pointer">
+              </label>
+            </div>
+            <textarea id="inputLyrics" rows="7" class="w-full bg-transparent p-3 text-xs font-mono outline-none resize-none placeholder-zinc-600" placeholder="[verse]&#10;Words go here...&#10;&#10;[chorus]&#10;Chorus line..."></textarea>
+          </div>
+
+          <!-- Параметры инференса -->
+          <div class="bg-suno-card rounded-xl border border-white/5 p-3 space-y-3">
+            <div class="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">Параметры инференса</div>
+            
+            <div class="space-y-1">
+              <span class="text-xs text-zinc-400">Режим планирования (CoT):</span>
+              <select id="selectCot" onchange="updateCotHint()" class="w-full bg-black/40 border border-white/10 rounded-lg p-2 text-xs outline-none text-white">
+                <option value="melody">cot="melody" (Каверы, фиксация мелодии)</option>
+                <option value="full">cot="full" (Гармония и ноты с нуля)</option>
+                <option value="off">cot="off" (Без нотного планирования)</option>
+              </select>
+              <p id="cotHint" class="text-[10px] text-zinc-500 leading-tight pt-1">
+                • <b>melody</b>: фиксирует мелодическую канву под новую инструментовку.
+              </p>
+            </div>
+
+            <div class="space-y-1">
+              <div class="flex justify-between text-xs">
+                <span class="text-zinc-400">CFG Scale:</span>
+                <span id="cfgVal" class="font-mono text-pink-400">1.2</span>
+              </div>
+              <input id="rangeCfg" type="range" min="1.0" max="2.5" step="0.1" value="1.2" oninput="document.getElementById('cfgVal').innerText = this.value" class="w-full accent-pink-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer">
+            </div>
+
+            <div class="flex items-center justify-between gap-2 pt-1">
+              <span class="text-xs text-zinc-400">Seed:</span>
+              <input id="inputSeed" type="number" value="42" class="w-24 bg-black/40 border border-white/10 rounded-lg px-2 py-1 text-xs font-mono text-right outline-none">
+              <button onclick="document.getElementById('inputSeed').value = Math.floor(Math.random()*999999)" class="text-xs bg-white/5 hover:bg-white/10 px-2 py-1 rounded border border-white/5">🎲</button>
+            </div>
+
+            <div class="pt-2 border-t border-white/5 flex items-center justify-between">
+              <div>
+                <div class="text-xs font-semibold text-white">Режим FAST (16 шагов)</div>
+                <div class="text-[10px] text-zinc-500">Генерация ~3-4 мин вместо 14 мин</div>
+              </div>
+              <input id="checkFast" type="checkbox" checked class="accent-pink-500 w-4 h-4 cursor-pointer">
+            </div>
+          </div>
+
+          <!-- Кнопка генерации -->
+          <button id="btnCreate" onclick="startGeneration()" class="w-full h-12 rounded-xl font-bold text-sm bg-gradient-to-r from-orange-500 to-pink-600 hover:brightness-110 active:scale-[0.98] transition-all flex items-center justify-center gap-2 shadow-lg">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+            Создать трек
+          </button>
+
+          <!-- Прогресс -->
+          <div id="progressBox" class="hidden p-3 rounded-xl bg-pink-500/10 border border-pink-500/20 space-y-2">
+            <div class="flex items-center gap-2 text-xs font-semibold text-pink-400">
+              <div class="w-2 h-2 rounded-full bg-pink-500 animate-ping"></div>
+              <span>Генерация выполняется...</span>
+            </div>
+            <div id="statusMessage" class="text-[11px] font-mono text-zinc-300">Инициализация...</div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- 3. История генераций -->
+      <main class="flex-1 bg-suno flex flex-col h-full overflow-hidden p-6">
+        <div class="max-w-4xl w-full mx-auto flex flex-col h-full">
+          
+          <div class="flex flex-col gap-4 mb-4 flex-shrink-0">
+            <div class="flex items-center justify-between">
+              <div>
+                <h1 class="text-xl font-bold">История генераций</h1>
+                <p class="text-xs text-zinc-500">Созданные треки в качестве 48kHz со всеми параметрами инференса</p>
+              </div>
+              <button onclick="loadHistoryList()" class="text-xs bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded-lg border border-white/5 transition-colors">Обновить</button>
+            </div>
+
+            <!-- Поиск -->
+            <div class="relative">
+              <input id="searchInput" oninput="filterHistory()" type="text" placeholder="Поиск по названию или стилю трека..." class="w-full bg-[#121214] border border-white/10 rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-zinc-500 outline-none focus:border-pink-500 transition-colors">
+              <svg class="w-4 h-4 text-zinc-500 absolute left-3 top-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+            </div>
+          </div>
+
+          <div id="historyList" class="flex-1 overflow-y-auto space-y-3 pr-2">
+            <div class="text-xs text-zinc-600 text-center py-10">Загрузка истории...</div>
+          </div>
+        </div>
+      </main>
+
+    </div>
+
+    <!-- 4. Нижний док аудиоплеера -->
+    <div id="globalPlayerBar" class="hidden h-20 bg-black/95 border-t border-white/10 px-6 flex items-center justify-between flex-shrink-0 z-50">
+      <div class="flex items-center gap-3 w-1/4">
+        <div class="w-12 h-12 rounded-lg bg-gradient-to-br from-pink-500 to-purple-600 flex items-center justify-center text-xs font-bold shadow-md flex-shrink-0">YuE</div>
+        <div class="overflow-hidden">
+          <div id="playerTitle" class="text-sm font-bold truncate">Трек</div>
+          <div id="playerSubtitle" class="text-xs text-zinc-500 truncate">Стиль</div>
+        </div>
+      </div>
+
+      <div class="flex flex-col items-center gap-1.5 flex-1 max-w-xl">
+        <div class="flex items-center gap-4">
+          <button onclick="toggleGlobalAudio()" class="w-10 h-10 rounded-full bg-white text-black flex items-center justify-center hover:scale-105 active:scale-95 transition-transform shadow-lg">
+            <svg id="playerPlayIcon" class="w-4 h-4 ml-0.5" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <svg id="playerPauseIcon" class="w-4 h-4 hidden" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+          </button>
+        </div>
+        <div class="flex items-center gap-3 w-full text-[11px] font-mono text-zinc-400">
+          <span id="playerCurrentTime">0:00</span>
+          <input id="playerProgress" type="range" min="0" max="100" value="0" oninput="seekAudio(this.value)" class="flex-1 accent-pink-500 h-1 bg-zinc-800 rounded-lg cursor-pointer">
+          <span id="playerDuration">0:00</span>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-end gap-2 w-1/4">
+        <svg class="w-4 h-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+        <input type="range" min="0" max="1" step="0.05" value="1" oninput="globalAudio.volume = this.value" class="w-20 accent-pink-500 h-1 bg-zinc-800 rounded-lg cursor-pointer">
+      </div>
+    </div>
+
+  </div>
+
+  <audio id="globalAudio" class="hidden"></audio>
+
+  <!-- Модальное окно: Управление LoRA -->
+  <div id="lorasModal" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-suno-card border border-white/10 rounded-2xl w-full max-w-xl p-6 space-y-4 shadow-2xl flex flex-col max-h-[85vh]">
+      <div class="flex items-center justify-between border-b border-white/5 pb-3">
+        <h2 class="text-base font-bold text-white flex items-center gap-2">
+          <span class="text-amber-400">✦</span> Менеджер LoRA Адаптеров
+        </h2>
+        <button onclick="closeLorasModal()" class="text-zinc-400 hover:text-white text-lg">✕</button>
+      </div>
+
+      <div class="text-[11px] text-zinc-400 bg-zinc-900/60 p-3 rounded-xl border border-white/5 space-y-1">
+        <div>Файлы моделей помещайте в папку репозитория: <code class="text-amber-300 font-mono">loras/</code></div>
+        <div class="text-zinc-500">Поддерживаемые расширения: .safetensors, .bin, .pt</div>
+      </div>
+
+      <div id="lorasManagerList" class="flex-1 overflow-y-auto space-y-2 pr-1"></div>
+
+      <div class="pt-2 border-t border-white/5 flex justify-end">
+        <button onclick="closeLorasModal()" class="px-4 py-2 bg-white/10 hover:bg-white/15 rounded-xl text-xs">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Редактор ABC партитуры -->
+  <div id="abcEditorModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+    <div class="bg-suno-card border border-white/10 rounded-2xl w-full max-w-4xl p-6 space-y-4 shadow-2xl flex flex-col max-h-[90vh]">
+      <div class="flex items-center justify-between border-b border-white/5 pb-3">
+        <div>
+          <h2 class="text-base font-bold text-white flex items-center gap-2">
+            <span class="text-pink-500">✎</span> Редактор нотной партитуры (score.abc)
+          </h2>
+          <p class="text-[11px] text-zinc-400">Изменяйте ноты, аккорды и темп; модель заново синтезирует аудио строго по вашей партитуре.</p>
+        </div>
+        <button onclick="closeAbcEditorModal()" class="text-zinc-400 hover:text-white text-lg">✕</button>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3">
+        <div class="space-y-1">
+          <label class="text-xs text-zinc-400">Название версии</label>
+          <input id="editorTrackTitle" type="text" class="w-full bg-zinc-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white outline-none">
+        </div>
+        <div class="space-y-1">
+          <label class="text-xs text-zinc-400">Стиль аранжировки</label>
+          <input id="editorTrackStyle" type="text" class="w-full bg-zinc-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white outline-none">
+        </div>
+        <div class="space-y-1">
+          <label class="text-xs text-zinc-400">Seed (голос / тембр)</label>
+          <input id="editorTrackSeed" type="number" class="w-full bg-zinc-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white outline-none font-mono">
+        </div>
+      </div>
+
+      <div class="flex-1 flex flex-col space-y-1 min-h-[300px]">
+        <label class="text-xs text-zinc-400 flex justify-between">
+          <span>Нотная запись ABC (ABC Notation):</span>
+          <span class="text-zinc-500">Стандарт ABC 2.1</span>
+        </label>
+        <textarea id="editorAbcContent" class="flex-1 w-full bg-black/60 border border-white/10 rounded-xl p-3 text-xs font-mono text-pink-300 outline-none resize-none leading-relaxed custom-scrollbar"></textarea>
+      </div>
+
+      <div class="pt-2 border-t border-white/5 flex items-center justify-between">
+        <span class="text-[11px] text-zinc-500">Генерация сохранит тот же seed вокала и адаптирует инструменты под стиль.</span>
+        <div class="flex gap-2">
+          <button onclick="closeAbcEditorModal()" class="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-xl text-xs">Отмена</button>
+          <button onclick="submitAbcRegeneration()" class="px-5 py-2 bg-gradient-to-r from-orange-500 to-pink-600 hover:brightness-110 rounded-xl text-xs font-bold text-white shadow-lg">Сгенерировать по партитуре</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Создание Persona -->
+  <div id="createPersonaModal" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-suno-card border border-white/10 rounded-2xl w-full max-w-md p-5 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-white/5 pb-3">
+        <h3 class="text-sm font-bold text-white flex items-center gap-2">
+          <span class="text-blue-400">✦</span> Создать Voice Persona
+        </h3>
+        <button onclick="closeCreatePersonaModal()" class="text-zinc-400 hover:text-white text-base">✕</button>
+      </div>
+
+      <div class="space-y-3">
+        <div class="space-y-1">
+          <label class="text-xs text-zinc-400">Имя персонажа / вокалиста</label>
+          <input id="personaNewName" type="text" placeholder="e.g. Grunge Male Vocalist" class="w-full bg-zinc-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white outline-none focus:border-blue-500">
+        </div>
+        <div class="space-y-1">
+          <label class="text-xs text-zinc-400">Стиль вокала и аранжировки</label>
+          <textarea id="personaNewStyle" rows="3" class="w-full bg-zinc-900 border border-white/10 rounded-xl p-3 text-xs text-white outline-none resize-none"></textarea>
+        </div>
+        <div class="space-y-1">
+          <label class="text-xs text-zinc-400">Зафиксированный Seed</label>
+          <input id="personaNewSeed" type="number" class="w-full bg-zinc-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white outline-none font-mono">
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-white/5">
+        <button onclick="closeCreatePersonaModal()" class="px-3 py-1.5 rounded-lg text-xs bg-white/5 hover:bg-white/10 text-zinc-300">Отмена</button>
+        <button onclick="submitSavePersona()" class="px-4 py-1.5 rounded-lg text-xs bg-blue-600 hover:bg-blue-500 text-white font-medium">Сохранить Persona</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Personas менеджер -->
+  <div id="personasModal" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-suno-card border border-white/10 rounded-2xl w-full max-w-xl p-6 space-y-4 shadow-2xl flex flex-col max-h-[85vh]">
+      <div class="flex items-center justify-between border-b border-white/5 pb-3">
+        <h2 class="text-base font-bold text-white flex items-center gap-2">
+          <span class="text-blue-400">✦</span> Сохраненные Voice Personas
+        </h2>
+        <button onclick="closePersonasModal()" class="text-zinc-400 hover:text-white text-lg">✕</button>
+      </div>
+      <div id="personasManagerList" class="flex-1 overflow-y-auto space-y-2 pr-1"></div>
+      <div class="pt-2 border-t border-white/5 flex justify-end">
+        <button onclick="closePersonasModal()" class="px-4 py-2 bg-white/10 hover:bg-white/15 rounded-xl text-xs">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Пресеты менеджер -->
+  <div id="presetsModal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-suno-card border border-white/10 rounded-2xl w-full max-w-xl p-6 space-y-4 shadow-2xl flex flex-col max-h-[85vh]">
+      <div class="flex items-center justify-between border-b border-white/5 pb-3">
+        <div class="flex items-center gap-2">
+          <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+          <h2 class="text-base font-bold text-white">Пресеты музыкальных стилей</h2>
+        </div>
+        <button onclick="closePresetsModal()" class="text-zinc-400 hover:text-white text-lg">✕</button>
+      </div>
+      <div id="presetsManagerList" class="flex-1 overflow-y-auto space-y-2 pr-1"></div>
+      <div class="pt-2 border-t border-white/5 flex justify-end">
+        <button onclick="closePresetsModal()" class="px-4 py-2 bg-white/10 hover:bg-white/15 rounded-xl text-xs font-medium">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Сохранение пресета -->
+  <div id="editPresetModal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div class="bg-suno-card border border-white/10 rounded-2xl w-full max-w-md p-5 space-y-4 shadow-2xl">
+      <div class="flex items-center justify-between border-b border-white/5 pb-3">
+        <h3 id="editPresetModalTitle" class="text-sm font-bold text-white">Сохранить пресет</h3>
+        <button onclick="closeEditPresetModal()" class="text-zinc-400 hover:text-white text-base">✕</button>
+      </div>
+      <input type="hidden" id="editPresetId" value="">
+      <div class="space-y-1">
+        <label class="text-xs text-zinc-400">Название пресета</label>
+        <input id="editPresetName" type="text" placeholder="Например: Dark Trip-Hop Lead" class="w-full bg-zinc-900 border border-white/10 rounded-xl px-3 py-2 text-xs text-white outline-none focus:border-pink-500">
+      </div>
+      <div class="space-y-1">
+        <label class="text-xs text-zinc-400">Описание стиля</label>
+        <textarea id="editPresetStyle" rows="4" class="w-full bg-zinc-900 border border-white/10 rounded-xl p-3 text-xs text-white outline-none resize-none focus:border-pink-500"></textarea>
+      </div>
+      <div class="flex justify-end gap-2 pt-2 border-t border-white/5">
+        <button onclick="closeEditPresetModal()" class="px-3 py-1.5 rounded-lg text-xs bg-white/5 hover:bg-white/10 text-zinc-300">Отмена</button>
+        <button onclick="submitSavePreset()" class="px-4 py-1.5 rounded-lg text-xs bg-pink-600 hover:bg-pink-500 text-white font-medium">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let rawHistoryData = [];
+    let rawPresetsData = [];
+    let rawPersonasData = [];
+    let rawLorasData = [];
+    let uploadedAudioFilename = null;
+    let uploadedMidiAbc = null;
+    const globalAudio = document.getElementById("globalAudio");
+    let currentPlayingId = null;
+
+    const cotDescriptions = {
+      "melody": "• <b>melody</b>: фиксирует вокальную мелодию под новую инструментовку (идеально для каверов).",
+      "full": "• <b>full</b>: выстраивает полную сетку аккордов и нот с нуля перед синтезом аудио.",
+      "off": "• <b>off</b>: отключает нотное планирование, прямой синтез по промпту."
+    };
+
+    function updateCotHint() {
+      const val = document.getElementById("selectCot").value;
+      document.getElementById("cotHint").innerHTML = cotDescriptions[val] || "";
+    }
+
+    // -------------------------------------------------------------
+    // LoRA Адаптеры
+    // -------------------------------------------------------------
+    async function loadLorasList() {
+      try {
+        const res = await fetch("/api/loras");
+        rawLorasData = await res.json();
+        renderLoraSelect();
+      } catch (e) {}
+    }
+
+    function renderLoraSelect() {
+      const select = document.getElementById("selectLora");
+      const currentVal = select.value;
+      select.innerHTML = '<option value="">Не использовать LoRA</option>' + 
+        rawLorasData.map(l => `
+          <option value="${l.filename}">${l.name} (${l.size})</option>
+        `).join("");
+      select.value = currentVal;
+      toggleLoraScale();
+    }
+
+    function toggleLoraScale() {
+      const val = document.getElementById("selectLora").value;
+      const box = document.getElementById("loraScaleBox");
+      if (val) {
+        box.classList.remove("hidden");
+      } else {
+        box.classList.add("hidden");
+      }
+    }
+
+    function openLorasModal() {
+      renderLorasManager();
+      document.getElementById("lorasModal").classList.remove("hidden");
+    }
+
+    function closeLorasModal() {
+      document.getElementById("lorasModal").classList.add("hidden");
+    }
+
+    function renderLorasManager() {
+      const list = document.getElementById("lorasManagerList");
+      if (!rawLorasData.length) {
+        list.innerHTML = '<div class="text-xs text-zinc-500 py-6 text-center">Адаптеры не найдены в папке loras/</div>';
+        return;
+      }
+      list.innerHTML = rawLorasData.map(l => `
+        <div class="bg-zinc-900/60 border border-white/5 rounded-xl p-3 flex items-center justify-between gap-3 hover:border-white/10 transition-colors">
+          <div class="min-w-0 flex-1">
+            <div class="text-xs font-bold text-white flex items-center gap-2">
+              <span>${l.name}</span>
+              <span class="text-[9px] bg-amber-500/20 text-amber-300 font-mono px-1 rounded">${l.size}</span>
+            </div>
+            <div class="text-[11px] font-mono text-zinc-500 truncate mt-0.5">${l.filename}</div>
+          </div>
+          <div class="flex items-center gap-1 flex-shrink-0">
+            <button onclick="selectLoraDirect('${l.filename}')" class="px-2 py-1 rounded text-[10px] bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 transition-colors">Выбрать</button>
+            <button onclick="deleteLoraFile('${l.filename}')" class="p-1.5 rounded text-zinc-400 hover:text-red-400 hover:bg-red-500/10 transition-colors" title="Удалить файл">✕</button>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function selectLoraDirect(fn) {
+      document.getElementById("selectLora").value = fn;
+      toggleLoraScale();
+      closeLorasModal();
+    }
+
+    async function deleteLoraFile(filename) {
+      if (!confirm(`Удалить файл ${filename} из папки loras?`)) return;
+      await fetch("/api/loras/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename })
+      });
+      await loadLorasList();
+      renderLorasManager();
+    }
+
+    // Загрузка и конвертация MIDI
+    async function handleMidiUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      const area = document.getElementById("midiUploadArea");
+      area.innerHTML = `<span class="text-purple-400 animate-pulse">Конвертация MIDI партитуры в ABC...</span>`;
+
+      const formData = new FormData();
+      formData.append("midi", file);
+
+      try {
+        const res = await fetch("/api/upload", { method: "POST", body: formData });
+        const data = await res.json();
+        if (data.success && data.is_midi) {
+          uploadedMidiAbc = data.abc;
+          area.innerHTML = `
+            <div class="flex items-center justify-between text-[11px] text-purple-300">
+              <span class="truncate font-semibold">♫ ${file.name} (MIDI подключен)</span>
+              <button onclick="clearMidiUpload(event)" class="text-zinc-500 hover:text-red-400 ml-2" title="Убрать MIDI">✕</button>
+            </div>
+          `;
+          clearAudioUpload();
+        } else {
+          area.innerHTML = `<span class="text-red-400">Ошибка парсинга MIDI</span>`;
+        }
+      } catch (err) {
+        area.innerHTML = `<span class="text-red-400">Не удалось загрузить MIDI</span>`;
+      }
+    }
+
+    function clearMidiUpload(event) {
+      if (event) event.stopPropagation();
+      uploadedMidiAbc = null;
+      document.getElementById("midiFileInput").value = "";
+      document.getElementById("midiUploadArea").innerHTML = "MIDI не выбран (будет сгенерирована новая мелодия)";
+    }
+
+    async function deleteTrack(trackId, title) {
+      const confirmed = confirm(`Вы уверены, что хотите безвозвратно удалить трек "${title}"?\nВсе аудиофайлы и нотные партитуры будут удалены с диска.`);
+      if (!confirmed) return;
+
+      try {
+        const res = await fetch("/api/tracks/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: trackId })
+        });
+        const data = await res.json();
+        if (data.success) {
+          if (currentPlayingId === trackId) {
+            globalAudio.pause();
+            currentPlayingId = null;
+            document.getElementById("globalPlayerBar").classList.add("hidden");
+            document.getElementById("globalPlayerBar").classList.remove("flex");
+          }
+          await loadHistoryList();
+        }
+      } catch (err) {
+        alert("Ошибка при удалении трека.");
+      }
+    }
+
+    async function openAbcEditor(trackId) {
+      const item = rawHistoryData.find(x => x.id === trackId);
+      if (!item) return;
+
+      document.getElementById("editorTrackTitle").value = (item.title || "Track") + " (Edit)";
+      document.getElementById("editorTrackStyle").value = item.style || "";
+      document.getElementById("editorTrackSeed").value = item.seed || 42;
+      document.getElementById("editorAbcContent").value = "Загрузка партитуры...";
+      document.getElementById("abcEditorModal").classList.remove("hidden");
+
+      try {
+        const res = await fetch(`/api/score?id=${trackId}`);
+        const data = await res.json();
+        if (data.success) {
+          document.getElementById("editorAbcContent").value = data.abc;
+        } else {
+          document.getElementById("editorAbcContent").value = `% Партитура для этого трека еще не была сохранена.\nX:1\nT:${item.title}\nM:4/4\nL:1/8\nK:C\n`;
+        }
+      } catch (err) {
+        document.getElementById("editorAbcContent").value = "% Ошибка загрузки партитуры score.abc";
+      }
+    }
+
+    function closeAbcEditorModal() {
+      document.getElementById("abcEditorModal").classList.add("hidden");
+    }
+
+    async function submitAbcRegeneration() {
+      const title = document.getElementById("editorTrackTitle").value.trim();
+      const style = document.getElementById("editorTrackStyle").value.trim();
+      const seed = parseInt(document.getElementById("editorTrackSeed").value) || 42;
+      const abc = document.getElementById("editorAbcContent").value.trim();
+
+      if (!style || !abc) {
+        alert("Заполните стиль и нотную партитуру ABC!");
+        return;
+      }
+
+      closeAbcEditorModal();
+
+      document.getElementById("btnCreate").disabled = true;
+      document.getElementById("btnCreate").classList.add("opacity-50");
+      document.getElementById("progressBox").classList.remove("hidden");
+
+      await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          style,
+          lyrics: "",
+          cot: "full",
+          cfg_scale: 1.2,
+          seed,
+          fast_mode: document.getElementById("checkFast").checked,
+          is_instrumental: false,
+          abc_score: abc,
+          lora_file: document.getElementById("selectLora").value || null,
+          lora_scale: parseFloat(document.getElementById("rangeLoraScale").value) || 0.8
+        })
+      });
+
+      pollStatus();
+    }
+
+    async function loadPersonasList() {
+      try {
+        const res = await fetch("/api/personas");
+        rawPersonasData = await res.json();
+        renderPersonaSelect();
+      } catch (e) {}
+    }
+
+    function renderPersonaSelect() {
+      const select = document.getElementById("selectPersona");
+      const currentVal = select.value;
+      select.innerHTML = '<option value="">Без фиксации (Random)</option>' + 
+        rawPersonasData.map(p => `
+          <option value="${p.id}">${p.name} (Seed: ${p.seed})</option>
+        `).join("");
+      select.value = currentVal;
+    }
+
+    function applySelectedPersona() {
+      const pId = document.getElementById("selectPersona").value;
+      if (!pId) return;
+      const p = rawPersonasData.find(x => x.id === pId);
+      if (p) {
+        document.getElementById("inputStyle").value = p.style;
+        document.getElementById("inputSeed").value = p.seed;
+        if (p.cot) document.getElementById("selectCot").value = p.cot;
+        updateCotHint();
+      }
+    }
+
+    function openCreatePersonaFromTrack(trackId) {
+      const item = rawHistoryData.find(x => x.id === trackId);
+      if (!item) return;
+
+      document.getElementById("personaNewName").value = `${item.title} Voice`;
+      document.getElementById("personaNewStyle").value = item.style;
+      document.getElementById("personaNewSeed").value = item.seed;
+      document.getElementById("createPersonaModal").classList.remove("hidden");
+    }
+
+    function closeCreatePersonaModal() {
+      document.getElementById("createPersonaModal").classList.add("hidden");
+    }
+
+    async function submitSavePersona() {
+      const name = document.getElementById("personaNewName").value.trim();
+      const style = document.getElementById("personaNewStyle").value.trim();
+      const seed = parseInt(document.getElementById("personaNewSeed").value) || 42;
+
+      if (!name || !style) {
+        alert("Заполните имя и стиль персоны!");
+        return;
+      }
+
+      await fetch("/api/personas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, style, seed, cot: "melody" })
+      });
+
+      closeCreatePersonaModal();
+      await loadPersonasList();
+      renderPersonasManager();
+    }
+
+    function openPersonasModal() {
+      renderPersonasManager();
+      document.getElementById("personasModal").classList.remove("hidden");
+    }
+
+    function closePersonasModal() {
+      document.getElementById("personasModal").classList.add("hidden");
+    }
+
+    function renderPersonasManager() {
+      const list = document.getElementById("personasManagerList");
+      if (!rawPersonasData.length) {
+        list.innerHTML = '<div class="text-xs text-zinc-500 py-6 text-center">Голосовые персоны еще не созданы</div>';
+        return;
+      }
+      list.innerHTML = rawPersonasData.map(p => `
+        <div class="bg-zinc-900/60 border border-white/5 rounded-xl p-3 flex items-center justify-between gap-3 hover:border-white/10 transition-colors">
+          <div class="min-w-0 flex-1">
+            <div class="text-xs font-bold text-white flex items-center gap-2">
+              <span>${p.name}</span>
+              <span class="text-[9px] bg-blue-500/20 text-blue-300 font-mono px-1 rounded">Seed: ${p.seed}</span>
+            </div>
+            <div class="text-[11px] text-zinc-400 truncate mt-0.5">${p.style}</div>
+          </div>
+          <div class="flex items-center gap-1 flex-shrink-0">
+            <button onclick="applyPersonaDirect('${p.id}')" class="px-2 py-1 rounded text-[10px] bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 transition-colors">Выбрать</button>
+            <button onclick="deletePersona('${p.id}')" class="p-1.5 rounded text-zinc-400 hover:text-red-400 hover:bg-red-500/10 transition-colors" title="Удалить">✕</button>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function applyPersonaDirect(id) {
+      document.getElementById("selectPersona").value = id;
+      applySelectedPersona();
+      closePersonasModal();
+    }
+
+    async function deletePersona(id) {
+      if (!confirm("Удалить эту персону?")) return;
+      await fetch("/api/personas/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      });
+      await loadPersonasList();
+      renderPersonasManager();
+    }
+
+    async function loadPresetsList() {
+      try {
+        const res = await fetch("/api/presets");
+        rawPresetsData = await res.json();
+        renderPresetDropdown();
+      } catch (e) {}
+    }
+
+    function togglePresetDropdown() {
+      document.getElementById("presetDropdown").classList.toggle("hidden");
+    }
+
+    window.addEventListener("click", (e) => {
+      const dd = document.getElementById("presetDropdown");
+      if (!dd.contains(e.target) && !e.target.closest("button[onclick='togglePresetDropdown()']")) {
+        dd.classList.add("hidden");
+      }
+    });
+
+    function renderPresetDropdown() {
+      const container = document.getElementById("presetDropdownList");
+      if (!rawPresetsData.length) {
+        container.innerHTML = '<div class="p-3 text-zinc-500 text-[11px] text-center">Нет пресетов</div>';
+        return;
+      }
+      container.innerHTML = rawPresetsData.map(p => `
+        <button onclick='selectPreset(${JSON.stringify(p).replace(/'/g, "&apos;")})' class="w-full text-left px-3 py-2 hover:bg-white/10 transition-colors flex flex-col gap-0.5 border-b border-white/5 last:border-0">
+          <span class="font-bold text-xs text-white truncate">${p.name}</span>
+          <span class="text-[10px] text-zinc-400 truncate">${p.style}</span>
+        </button>
+      `).join("");
+    }
+
+    function selectPreset(preset) {
+      document.getElementById("inputStyle").value = preset.style;
+      document.getElementById("presetDropdown").classList.add("hidden");
+    }
+
+    function openCreatePresetModal() {
+      document.getElementById("editPresetId").value = "";
+      document.getElementById("editPresetModalTitle").innerText = "Создать пресет";
+      document.getElementById("editPresetName").value = "";
+      document.getElementById("editPresetStyle").value = document.getElementById("inputStyle").value.trim();
+      document.getElementById("editPresetModal").classList.remove("hidden");
+    }
+
+    function openEditExistingPreset(id) {
+      const p = rawPresetsData.find(x => x.id === id);
+      if (!p) return;
+      document.getElementById("editPresetId").value = p.id;
+      document.getElementById("editPresetModalTitle").innerText = "Редактировать пресет";
+      document.getElementById("editPresetName").value = p.name;
+      document.getElementById("editPresetStyle").value = p.style;
+      document.getElementById("editPresetModal").classList.remove("hidden");
+    }
+
+    function closeEditPresetModal() {
+      document.getElementById("editPresetModal").classList.add("hidden");
+    }
+
+    async function submitSavePreset() {
+      const id = document.getElementById("editPresetId").value;
+      const name = document.getElementById("editPresetName").value.trim();
+      const style = document.getElementById("editPresetStyle").value.trim();
+
+      if (!name || !style) {
+        alert("Заполните название и стиль!");
+        return;
+      }
+
+      await fetch("/api/presets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, name, style })
+      });
+
+      closeEditPresetModal();
+      await loadPresetsList();
+      renderPresetsManager();
+    }
+
+    async function deletePreset(id) {
+      if (!confirm("Удалить этот пресет?")) return;
+      await fetch("/api/presets/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      });
+      await loadPresetsList();
+      renderPresetsManager();
+    }
+
+    function openPresetsModal() {
+      renderPresetsManager();
+      document.getElementById("presetsModal").classList.remove("hidden");
+    }
+
+    function closePresetsModal() {
+      document.getElementById("presetsModal").classList.add("hidden");
+    }
+
+    function renderPresetsManager() {
+      const list = document.getElementById("presetsManagerList");
+      if (!rawPresetsData.length) {
+        list.innerHTML = '<div class="text-xs text-zinc-500 py-6 text-center">Пресеты отсутствуют</div>';
+        return;
+      }
+      list.innerHTML = rawPresetsData.map(p => `
+        <div class="bg-zinc-900/60 border border-white/5 rounded-xl p-3 flex items-center justify-between gap-3 hover:border-white/10 transition-colors">
+          <div class="min-w-0 flex-1">
+            <div class="text-xs font-bold text-white truncate">${p.name}</div>
+            <div class="text-[11px] text-zinc-400 truncate mt-0.5">${p.style}</div>
+          </div>
+          <div class="flex items-center gap-1 flex-shrink-0">
+            <button onclick="selectPresetFromManager('${p.id}')" class="px-2 py-1 rounded text-[10px] bg-pink-500/20 text-pink-400 hover:bg-pink-500/30">Вставить</button>
+            <button onclick="openEditExistingPreset('${p.id}')" class="p-1.5 rounded text-zinc-400 hover:text-white">✎</button>
+            <button onclick="deletePreset('${p.id}')" class="p-1.5 rounded text-zinc-400 hover:text-red-400">✕</button>
+          </div>
+        </div>
+      `).join("");
+    }
+
+    function selectPresetFromManager(id) {
+      const p = rawPresetsData.find(x => x.id === id);
+      if (p) {
+        selectPreset(p);
+        closePresetsModal();
+      }
+    }
+
+    async function handleAudioUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      const area = document.getElementById("coverUploadArea");
+      area.innerHTML = `<span class="text-pink-400 animate-pulse">Загрузка ${file.name}...</span>`;
+
+      const formData = new FormData();
+      formData.append("audio", file);
+
+      try {
+        const res = await fetch("/api/upload", { method: "POST", body: formData });
+        const data = await res.json();
+        if (data.success) {
+          uploadedAudioFilename = data.filename;
+          area.innerHTML = `
+            <div class="flex items-center justify-between text-[11px] text-green-400">
+              <span class="truncate">♫ ${file.name}</span>
+              <button onclick="clearAudioUpload(event)" class="text-zinc-500 hover:text-red-400 ml-2">✕</button>
+            </div>
+          `;
+          document.getElementById("selectCot").value = "melody";
+          updateCotHint();
+          clearMidiUpload();
+        }
+      } catch (err) {
+        area.innerHTML = `<span class="text-red-400">Ошибка загрузки файла</span>`;
+      }
+    }
+
+    function clearAudioUpload(event) {
+      if (event) event.stopPropagation();
+      uploadedAudioFilename = null;
+      document.getElementById("coverFileInput").value = "";
+      document.getElementById("coverUploadArea").innerHTML = "Файл не выбран (генерация новой мелодии)";
+    }
+
+    function toggleInstrumental() {
+      const isInst = document.getElementById("checkInstrumental").checked;
+      const lyricsEl = document.getElementById("inputLyrics");
+      if (isInst) {
+        lyricsEl.disabled = true;
+        lyricsEl.classList.add("opacity-40");
+        lyricsEl.placeholder = "[Режим Инструментал включен: слова не требуются]";
+      } else {
+        lyricsEl.disabled = false;
+        lyricsEl.classList.remove("opacity-40");
+        lyricsEl.placeholder = "[verse]\nWords go here...\n\n[chorus]\nChorus line...";
+      }
+    }
+
+    async function editProfileName() {
+      const current = document.getElementById("profileNameDisplay").innerText;
+      const newName = prompt("Введите имя профиля:", current);
+      if (newName && newName.trim() !== "") {
+        await fetch("/api/profile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: newName.trim() })
+        });
+        loadProfileData();
+      }
+    }
+
+    async function loadProfileData() {
+      try {
+        const res = await fetch("/api/profile");
+        const data = await res.json();
+        document.getElementById("profileNameDisplay").innerText = data.name;
+        document.getElementById("profileAvatar").innerText = data.avatar_letter;
+      } catch (e) {}
+    }
+
+    function playTrack(id, url, title, subtitle) {
+      if (currentPlayingId === id && !globalAudio.paused) {
+        globalAudio.pause();
+        return;
+      }
+
+      if (currentPlayingId !== id) {
+        currentPlayingId = id;
+        globalAudio.src = url;
+        document.getElementById("playerTitle").innerText = title;
+        document.getElementById("playerSubtitle").innerText = subtitle;
+        document.getElementById("globalPlayerBar").classList.remove("hidden");
+        document.getElementById("globalPlayerBar").classList.add("flex");
+      }
+      globalAudio.play();
+    }
+
+    function toggleGlobalAudio() {
+      if (globalAudio.paused) {
+        globalAudio.play();
+      } else {
+        globalAudio.pause();
+      }
+    }
+
+    globalAudio.onplay = () => {
+      document.getElementById("playerPlayIcon").classList.add("hidden");
+      document.getElementById("playerPauseIcon").classList.remove("hidden");
+      renderHistoryItems(getFilteredList());
+    };
+
+    globalAudio.onpause = () => {
+      document.getElementById("playerPlayIcon").classList.remove("hidden");
+      document.getElementById("playerPauseIcon").classList.add("hidden");
+      renderHistoryItems(getFilteredList());
+    };
+
+    globalAudio.ontimeupdate = () => {
+      if (!isNaN(globalAudio.duration) && globalAudio.duration > 0) {
+        const progress = (globalAudio.currentTime / globalAudio.duration) * 100;
+        document.getElementById("playerProgress").value = progress;
+        document.getElementById("playerCurrentTime").innerText = formatTime(globalAudio.currentTime);
+        document.getElementById("playerDuration").innerText = formatTime(globalAudio.duration);
+      }
+    };
+
+    function seekAudio(percent) {
+      if (!isNaN(globalAudio.duration)) {
+        globalAudio.currentTime = (percent / 100) * globalAudio.duration;
+      }
+    }
+
+    function formatTime(seconds) {
+      const mins = Math.floor(seconds / 60);
+      const secs = Math.floor(seconds % 60);
+      return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+    }
+
+    async function rateTrack(id, rating) {
+      await fetch("/api/rate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, rating })
+      });
+      const item = rawHistoryData.find(x => x.id === id);
+      if (item) {
+        item.rating = item.rating === rating ? 0 : rating;
+        renderHistoryItems(getFilteredList());
+      }
+    }
+
+    function getFilteredList() {
+      const q = document.getElementById("searchInput").value.toLowerCase().trim();
+      if (!q) return rawHistoryData;
+      return rawHistoryData.filter(item => 
+        (item.title && item.title.toLowerCase().includes(q)) ||
+        (item.style && item.style.toLowerCase().includes(q))
+      );
+    }
+
+    function filterHistory() {
+      renderHistoryItems(getFilteredList());
+    }
+
+    async function loadHistoryList() {
+      try {
+        const res = await fetch("/api/history");
+        rawHistoryData = await res.json();
+        renderHistoryItems(getFilteredList());
+      } catch (e) {}
+    }
+
+    function renderHistoryItems(list) {
+      const container = document.getElementById("historyList");
+      if (list.length === 0) {
+        container.innerHTML = '<div class="text-xs text-zinc-600 text-center py-10">Треки не найдены.</div>';
+        return;
+      }
+
+      container.innerHTML = list.map(item => {
+        const isPlaying = currentPlayingId === item.id && !globalAudio.paused;
+        const isLiked = item.rating === 1;
+        const isDisliked = item.rating === -1;
+
+        return `
+          <div class="bg-suno-card rounded-xl border border-white/5 p-3 hover:border-white/10 transition-all flex items-start gap-3">
+            
+            <div class="relative w-14 h-14 rounded-lg bg-gradient-to-br from-pink-500 to-purple-600 flex-shrink-0 flex items-center justify-center cursor-pointer shadow-md overflow-hidden" onclick='playTrack("${item.id}", "${item.url}", "${item.title.replace(/"/g, '&quot;')}", "${item.style.replace(/"/g, '&quot;')}")'>
+              <div class="absolute inset-0 bg-black/25"></div>
+              
+              <button class="relative z-10 w-8 h-8 rounded-full bg-white text-black flex items-center justify-center shadow-lg hover:scale-110 active:scale-95 transition-transform">
+                ${isPlaying 
+                  ? '<svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>'
+                  : '<svg class="w-4 h-4 ml-0.5" fill="currentColor" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg>'
+                }
+              </button>
+            </div>
+
+            <div class="flex-1 min-w-0 space-y-1">
+              <div class="flex items-center justify-between gap-2">
+                <div class="flex items-center gap-2 truncate">
+                  <h3 class="font-bold text-sm text-white truncate cursor-pointer hover:underline" onclick='playTrack("${item.id}", "${item.url}", "${item.title.replace(/"/g, '&quot;')}", "${item.style.replace(/"/g, '&quot;')}")'>${item.title}</h3>
+                  <span class="text-[9px] bg-pink-500/20 text-pink-400 px-1.5 py-0.5 rounded font-mono">${item.fast_mode ? 'FAST' : 'HQ'}</span>
+                  ${item.is_instrumental ? '<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">INST</span>' : ''}
+                  ${item.reference_audio ? '<span class="text-[9px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded font-mono">COVER</span>' : ''}
+                  ${item.is_midi_gen ? '<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">FROM MIDI</span>' : ''}
+                  ${item.lora ? `<span class="text-[9px] bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded font-mono">LORA (${item.lora_scale})</span>` : ''}
+                </div>
+                <div class="text-[10px] text-zinc-500 font-mono flex-shrink-0">${item.duration_render || ''}</div>
+              </div>
+
+              <p class="text-xs text-zinc-400 line-clamp-1">${item.style}</p>
+
+              <div class="flex flex-wrap gap-2 text-[10px] font-mono text-zinc-500 pt-0.5">
+                <span>cot: <b class="text-zinc-300">${item.cot}</b></span>
+                <span>cfg: <b class="text-zinc-300">${item.cfg_scale}</b></span>
+                <span>seed: <b class="text-zinc-300">${item.seed}</b></span>
+                ${item.lora ? `<span>lora: <b class="text-amber-400">${item.lora}</b></span>` : ''}
+              </div>
+
+              <!-- Кнопки действий -->
+              <div class="flex items-center justify-between pt-2 border-t border-white/5 flex-wrap gap-2">
+                <div class="flex items-center gap-1">
+                  <button onclick="rateTrack('${item.id}', 1)" class="p-1.5 rounded-lg hover:bg-white/5 transition-colors ${isLiked ? 'text-pink-500' : 'text-zinc-500 hover:text-white'}" title="Нравится">
+                    <svg class="w-4 h-4" fill="${isLiked ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 10h4.764a2 2 0 011.789 2.894l-3.5 7A2 2 0 0115.263 21h-4.017c-.163 0-.326-.02-.485-.06L7 20m7-10V5a2 2 0 00-2-2h-.095c-.5 0-.905.405-.905.905 0 .714-.211 1.412-.608 2.006L7 11v9m7-10h-2M7 20H5a2 2 0 01-2-2v-6a2 2 0 012-2h2.5"/></svg>
+                  </button>
+                  <button onclick="rateTrack('${item.id}', -1)" class="p-1.5 rounded-lg hover:bg-white/5 transition-colors ${isDisliked ? 'text-red-400' : 'text-zinc-500 hover:text-white'}" title="Не нравится">
+                    <svg class="w-4 h-4" fill="${isDisliked ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14H5.236a2 2 0 01-1.789-2.894l3.5-7A2 2 0 018.736 3h4.018a2 2 0 01.485.06l3.76 1.02m-7 10v5a2 2 0 002 2h.096c.5 0 .905-.405.905-.904 0-.715.211-1.413.608-2.008L17 13V4m-7 10h2m5-10h2a2 2 0 012 2v6a2 2 0 01-2 2h-2.5"/></svg>
+                  </button>
+                </div>
+
+                <div class="flex items-center gap-1.5 flex-wrap">
+                  <button onclick="openAbcEditor('${item.id}')" class="px-2 py-1 rounded-md text-xs bg-pink-500/15 hover:bg-pink-500/25 text-pink-300 transition-colors flex items-center gap-1" title="Редактировать партитуру">
+                    <span>✎</span> Edit
+                  </button>
+                  
+                  <button onclick="openCreatePersonaFromTrack('${item.id}')" class="px-2 py-1 rounded-md text-xs bg-blue-500/15 hover:bg-blue-500/25 text-blue-300 transition-colors flex items-center gap-1" title="Сохранить как Persona">
+                    <span>✦</span> Persona
+                  </button>
+
+                  <a href="/api/midi?id=${item.id}" download="track_${item.id}.mid" class="px-2 py-1 rounded-md text-xs bg-purple-500/15 hover:bg-purple-500/25 text-purple-300 transition-colors flex items-center gap-1" title="Экспорт в MIDI">
+                    <span>♫</span> MIDI
+                  </a>
+
+                  <button onclick='recreateTrack(${JSON.stringify(item).replace(/'/g, "&apos;")})' class="px-2 py-1 rounded-md text-xs bg-white/5 hover:bg-white/10 text-zinc-300 hover:text-white transition-colors flex items-center gap-1">
+                    <span>↻</span> Повторить
+                  </button>
+
+                  <a href="${item.url}" download="${item.filename}" class="px-2.5 py-1 rounded-md text-xs bg-pink-600 hover:bg-pink-500 text-white font-medium transition-colors flex items-center gap-1">
+                    <span>↓</span> FLAC
+                  </a>
+
+                  <button onclick="deleteTrack('${item.id}', '${item.title.replace(/'/g, "\\'")}')" class="p-1 rounded-md text-zinc-500 hover:text-red-400 hover:bg-red-500/10 transition-colors" title="Удалить трек">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function recreateTrack(item) {
+      document.getElementById("inputTitle").value = item.title || "";
+      document.getElementById("inputStyle").value = item.style || "";
+      document.getElementById("inputLyrics").value = item.lyrics || "";
+      document.getElementById("selectCot").value = item.cot || "melody";
+      document.getElementById("rangeCfg").value = item.cfg_scale || 1.2;
+      document.getElementById("cfgVal").innerText = item.cfg_scale || 1.2;
+      document.getElementById("inputSeed").value = item.seed || 42;
+      document.getElementById("checkFast").checked = item.fast_mode !== false;
+      document.getElementById("checkInstrumental").checked = !!item.is_instrumental;
+
+      if (item.lora) {
+        document.getElementById("selectLora").value = item.lora;
+        if (item.lora_scale) {
+          document.getElementById("rangeLoraScale").value = item.lora_scale;
+          document.getElementById("loraScaleVal").innerText = item.lora_scale;
+        }
+      } else {
+        document.getElementById("selectLora").value = "";
+      }
+      toggleLoraScale();
+
+      toggleInstrumental();
+      updateCotHint();
+      window.scrollTo({top: 0, behavior: 'smooth'});
+    }
+
+    async function startGeneration() {
+      const title = document.getElementById("inputTitle").value;
+      const style = document.getElementById("inputStyle").value;
+      const lyrics = document.getElementById("inputLyrics").value;
+      const cot = document.getElementById("selectCot").value;
+      const cfg_scale = parseFloat(document.getElementById("rangeCfg").value);
+      const seed = parseInt(document.getElementById("inputSeed").value);
+      const fast_mode = document.getElementById("checkFast").checked;
+      const is_instrumental = document.getElementById("checkInstrumental").checked;
+      const lora_file = document.getElementById("selectLora").value || null;
+      const lora_scale = parseFloat(document.getElementById("rangeLoraScale").value) || 0.8;
+
+      if (!style.trim()) {
+        alert("Укажите стиль музыки!");
+        return;
+      }
+
+      document.getElementById("btnCreate").disabled = true;
+      document.getElementById("btnCreate").classList.add("opacity-50");
+      document.getElementById("progressBox").classList.remove("hidden");
+
+      await fetch("/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title, style, lyrics, cot, cfg_scale, seed, fast_mode, is_instrumental,
+          audio_file: uploadedAudioFilename,
+          abc_score: uploadedMidiAbc || "",
+          midi_source: !!uploadedMidiAbc,
+          lora_file,
+          lora_scale
+        })
+      });
+
+      pollStatus();
+    }
+
+    let pollInterval = null;
+    function pollStatus() {
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(async () => {
+        try {
+          const res = await fetch("/api/status");
+          const data = await res.json();
+          const task = data.current_task;
+
+          if (task.status === "running") {
+            document.getElementById("statusMessage").innerText = task.progress_msg || "Обработка...";
+          } else if (task.status === "completed" || task.status === "idle") {
+            document.getElementById("statusMessage").innerText = task.progress_msg || "Готово!";
+            document.getElementById("btnCreate").disabled = false;
+            document.getElementById("btnCreate").classList.remove("opacity-50");
+            setTimeout(() => {
+              document.getElementById("progressBox").classList.add("hidden");
+            }, 3000);
+            clearInterval(pollInterval);
+            loadHistoryList();
+          } else if (task.status === "error") {
+            document.getElementById("statusMessage").innerText = task.error || "Ошибка генерации";
+            document.getElementById("btnCreate").disabled = false;
+            document.getElementById("btnCreate").classList.remove("opacity-50");
+            clearInterval(pollInterval);
+          }
+        } catch (e) {}
+      }, 2500);
+    }
+
+    loadProfileData();
+    loadPresetsList();
+    loadPersonasList();
+    loadLorasList();
+    loadHistoryList();
+    updateCotHint();
+  </script>
+</body>
+</html>
