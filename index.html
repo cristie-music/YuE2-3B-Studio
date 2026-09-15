@@ -115,27 +115,41 @@
             </select>
           </div>
 
-          <!-- Выбор LoRA Адаптера -->
-          <div class="bg-suno-card rounded-xl border border-amber-500/20 bg-amber-500/5 p-2.5 space-y-2">
+          <!-- Выбор LoRA Адаптеров (Вокал + Стиль) -->
+          <div class="bg-suno-card rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 space-y-3">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-amber-400"></span>
-                <span class="text-xs font-bold text-amber-300 uppercase">LoRA Адаптер:</span>
+                <span class="text-xs font-bold text-amber-300 uppercase">LoRA Адаптеры</span>
               </div>
               <button onclick="loadLorasList()" class="text-[10px] text-zinc-400 hover:text-white" title="Обновить список">↻ Обновить</button>
             </div>
             
-            <div class="flex items-center gap-2">
-              <select id="selectLora" onchange="toggleLoraScale()" class="flex-1 bg-zinc-900 border border-white/10 rounded-lg px-2 py-1 text-xs text-white outline-none">
-                <option value="">Не использовать LoRA</option>
+            <!-- Вокальная LoRA -->
+            <div class="space-y-1.5">
+              <div class="flex items-center justify-between text-[11px]">
+                <span class="text-zinc-400">🎤 Вокальная LoRA (AR):</span>
+                <span id="vocalScaleVal" class="font-mono text-amber-300">0.8</span>
+              </div>
+              <select id="selectVocalLora" onchange="updateLoraInputs()" class="w-full bg-zinc-900 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white outline-none">
+                <option value="">Без вокальной LoRA</option>
               </select>
+              <div id="vocalScaleBox" class="hidden flex items-center gap-2 pt-0.5">
+                <input id="rangeVocalScale" type="range" min="0.1" max="1.5" step="0.05" value="0.8" oninput="document.getElementById('vocalScaleVal').innerText = this.value" class="w-full accent-amber-400 h-1 bg-zinc-800 rounded-lg cursor-pointer">
+              </div>
             </div>
 
-            <div id="loraScaleBox" class="hidden flex items-center justify-between gap-2 pt-1 border-t border-white/5 text-[11px]">
-              <span class="text-zinc-400">Сила (Scale):</span>
-              <div class="flex items-center gap-2 flex-1 max-w-[160px]">
-                <input id="rangeLoraScale" type="range" min="0.1" max="1.5" step="0.05" value="0.8" oninput="document.getElementById('loraScaleVal').innerText = this.value" class="w-full accent-amber-400 h-1 bg-zinc-800 rounded-lg cursor-pointer">
-                <span id="loraScaleVal" class="font-mono text-amber-300 w-8 text-right">0.8</span>
+            <!-- Стилевая LoRA -->
+            <div class="space-y-1.5 pt-1 border-t border-white/5">
+              <div class="flex items-center justify-between text-[11px]">
+                <span class="text-zinc-400">🎸 Стилевая LoRA (NAR):</span>
+                <span id="styleScaleVal" class="font-mono text-purple-300">0.8</span>
+              </div>
+              <select id="selectStyleLora" onchange="updateLoraInputs()" class="w-full bg-zinc-900 border border-white/10 rounded-lg px-2 py-1.5 text-xs text-white outline-none">
+                <option value="">Без стилевой LoRA</option>
+              </select>
+              <div id="styleScaleBox" class="hidden flex items-center gap-2 pt-0.5">
+                <input id="rangeStyleScale" type="range" min="0.1" max="1.5" step="0.05" value="0.8" oninput="document.getElementById('styleScaleVal').innerText = this.value" class="w-full accent-purple-400 h-1 bg-zinc-800 rounded-lg cursor-pointer">
               </div>
             </div>
           </div>
@@ -339,7 +353,7 @@
 
       <div class="text-[11px] text-zinc-400 bg-zinc-900/60 p-3 rounded-xl border border-white/5 space-y-1">
         <div>Файлы моделей помещайте в папку репозитория: <code class="text-amber-300 font-mono">loras/</code></div>
-        <div class="text-zinc-500">Поддерживаемые расширения: .safetensors, .bin, .pt</div>
+        <div class="text-zinc-500">Поддерживаемые форматы: .safetensors, .bin, .pt</div>
       </div>
 
       <div id="lorasManagerList" class="flex-1 overflow-y-auto space-y-2 pr-1"></div>
@@ -506,35 +520,41 @@
     }
 
     // -------------------------------------------------------------
-    // LoRA Адаптеры
+    // LoRA Адаптеры (Вокал + Стиль)
     // -------------------------------------------------------------
     async function loadLorasList() {
       try {
         const res = await fetch("/api/loras");
         rawLorasData = await res.json();
-        renderLoraSelect();
+        renderLoraSelects();
       } catch (e) {}
     }
 
-    function renderLoraSelect() {
-      const select = document.getElementById("selectLora");
-      const currentVal = select.value;
-      select.innerHTML = '<option value="">Не использовать LoRA</option>' + 
-        rawLorasData.map(l => `
-          <option value="${l.filename}">${l.name} (${l.size})</option>
-        `).join("");
-      select.value = currentVal;
-      toggleLoraScale();
+    function renderLoraSelects() {
+      const vSel = document.getElementById("selectVocalLora");
+      const sSel = document.getElementById("selectStyleLora");
+      const vCur = vSel.value;
+      const sCur = sSel.value;
+
+      const options = '<option value="">(Не выбрано)</option>' + 
+        rawLorasData.map(l => `<option value="${l.filename}">${l.name} (${l.size})</option>`).join("");
+
+      vSel.innerHTML = options;
+      sSel.innerHTML = options;
+      vSel.value = vCur;
+      sSel.value = sCur;
+      updateLoraInputs();
     }
 
-    function toggleLoraScale() {
-      const val = document.getElementById("selectLora").value;
-      const box = document.getElementById("loraScaleBox");
-      if (val) {
-        box.classList.remove("hidden");
-      } else {
-        box.classList.add("hidden");
-      }
+    function updateLoraInputs() {
+      const vVal = document.getElementById("selectVocalLora").value;
+      const sVal = document.getElementById("selectStyleLora").value;
+      
+      const vBox = document.getElementById("vocalScaleBox");
+      const sBox = document.getElementById("styleScaleBox");
+
+      if (vVal) vBox.classList.remove("hidden"); else vBox.classList.add("hidden");
+      if (sVal) sBox.classList.remove("hidden"); else sBox.classList.add("hidden");
     }
 
     function openLorasModal() {
@@ -562,16 +582,18 @@
             <div class="text-[11px] font-mono text-zinc-500 truncate mt-0.5">${l.filename}</div>
           </div>
           <div class="flex items-center gap-1 flex-shrink-0">
-            <button onclick="selectLoraDirect('${l.filename}')" class="px-2 py-1 rounded text-[10px] bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 transition-colors">Выбрать</button>
-            <button onclick="deleteLoraFile('${l.filename}')" class="p-1.5 rounded text-zinc-400 hover:text-red-400 hover:bg-red-500/10 transition-colors" title="Удалить файл">✕</button>
+            <button onclick="setLoraTo('vocal', '${l.filename}')" class="px-2 py-1 rounded text-[10px] bg-amber-500/20 text-amber-300 hover:bg-amber-500/30">В Вокал</button>
+            <button onclick="setLoraTo('style', '${l.filename}')" class="px-2 py-1 rounded text-[10px] bg-purple-500/20 text-purple-300 hover:bg-purple-500/30">В Стиль</button>
+            <button onclick="deleteLoraFile('${l.filename}')" class="p-1.5 rounded text-zinc-400 hover:text-red-400 hover:bg-red-500/10" title="Удалить">✕</button>
           </div>
         </div>
       `).join("");
     }
 
-    function selectLoraDirect(fn) {
-      document.getElementById("selectLora").value = fn;
-      toggleLoraScale();
+    function setLoraTo(target, fn) {
+      if (target === 'vocal') document.getElementById("selectVocalLora").value = fn;
+      if (target === 'style') document.getElementById("selectStyleLora").value = fn;
+      updateLoraInputs();
       closeLorasModal();
     }
 
@@ -706,8 +728,10 @@
           fast_mode: document.getElementById("checkFast").checked,
           is_instrumental: false,
           abc_score: abc,
-          lora_file: document.getElementById("selectLora").value || null,
-          lora_scale: parseFloat(document.getElementById("rangeLoraScale").value) || 0.8
+          vocal_lora: document.getElementById("selectVocalLora").value || null,
+          vocal_scale: parseFloat(document.getElementById("rangeVocalScale").value) || 0.8,
+          style_lora: document.getElementById("selectStyleLora").value || null,
+          style_scale: parseFloat(document.getElementById("rangeStyleScale").value) || 0.8
         })
       });
 
@@ -1157,7 +1181,8 @@
                   ${item.is_instrumental ? '<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">INST</span>' : ''}
                   ${item.reference_audio ? '<span class="text-[9px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded font-mono">COVER</span>' : ''}
                   ${item.is_midi_gen ? '<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">FROM MIDI</span>' : ''}
-                  ${item.lora ? `<span class="text-[9px] bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded font-mono">LORA (${item.lora_scale})</span>` : ''}
+                  ${item.vocal_lora ? `<span class="text-[9px] bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded font-mono">VOCAL LORA</span>` : ''}
+                  ${item.style_lora ? `<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">STYLE LORA</span>` : ''}
                 </div>
                 <div class="text-[10px] text-zinc-500 font-mono flex-shrink-0">${item.duration_render || ''}</div>
               </div>
@@ -1168,7 +1193,8 @@
                 <span>cot: <b class="text-zinc-300">${item.cot}</b></span>
                 <span>cfg: <b class="text-zinc-300">${item.cfg_scale}</b></span>
                 <span>seed: <b class="text-zinc-300">${item.seed}</b></span>
-                ${item.lora ? `<span>lora: <b class="text-amber-400">${item.lora}</b></span>` : ''}
+                ${item.vocal_lora ? `<span>v-lora: <b class="text-amber-400">${item.vocal_lora} (${item.vocal_scale})</b></span>` : ''}
+                ${item.style_lora ? `<span>s-lora: <b class="text-purple-400">${item.style_lora} (${item.style_scale})</b></span>` : ''}
               </div>
 
               <!-- Кнопки действий -->
@@ -1225,16 +1251,17 @@
       document.getElementById("checkFast").checked = item.fast_mode !== false;
       document.getElementById("checkInstrumental").checked = !!item.is_instrumental;
 
-      if (item.lora) {
-        document.getElementById("selectLora").value = item.lora;
-        if (item.lora_scale) {
-          document.getElementById("rangeLoraScale").value = item.lora_scale;
-          document.getElementById("loraScaleVal").innerText = item.lora_scale;
-        }
-      } else {
-        document.getElementById("selectLora").value = "";
+      document.getElementById("selectVocalLora").value = item.vocal_lora || "";
+      if (item.vocal_scale) {
+        document.getElementById("rangeVocalScale").value = item.vocal_scale;
+        document.getElementById("vocalScaleVal").innerText = item.vocal_scale;
       }
-      toggleLoraScale();
+      document.getElementById("selectStyleLora").value = item.style_lora || "";
+      if (item.style_scale) {
+        document.getElementById("rangeStyleScale").value = item.style_scale;
+        document.getElementById("styleScaleVal").innerText = item.style_scale;
+      }
+      updateLoraInputs();
 
       toggleInstrumental();
       updateCotHint();
@@ -1250,8 +1277,11 @@
       const seed = parseInt(document.getElementById("inputSeed").value);
       const fast_mode = document.getElementById("checkFast").checked;
       const is_instrumental = document.getElementById("checkInstrumental").checked;
-      const lora_file = document.getElementById("selectLora").value || null;
-      const lora_scale = parseFloat(document.getElementById("rangeLoraScale").value) || 0.8;
+      
+      const vocal_lora = document.getElementById("selectVocalLora").value || null;
+      const vocal_scale = parseFloat(document.getElementById("rangeVocalScale").value) || 0.8;
+      const style_lora = document.getElementById("selectStyleLora").value || null;
+      const style_scale = parseFloat(document.getElementById("rangeStyleScale").value) || 0.8;
 
       if (!style.trim()) {
         alert("Укажите стиль музыки!");
@@ -1270,8 +1300,8 @@
           audio_file: uploadedAudioFilename,
           abc_score: uploadedMidiAbc || "",
           midi_source: !!uploadedMidiAbc,
-          lora_file,
-          lora_scale
+          vocal_lora, vocal_scale,
+          style_lora, style_scale
         })
       });
 

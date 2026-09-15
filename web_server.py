@@ -39,7 +39,6 @@ os.environ["YUE_DISABLE_CUDA_GRAPH"] = "1"
 import torch
 import soundfile as sf
 
-# Определение доступного вычислительного бэкенда
 if torch.cuda.is_available():
     device = "cuda"
     torch.backends.cuda.enable_flash_sdp(False)
@@ -109,7 +108,7 @@ current_task = {
 }
 
 # -------------------------------------------------------------
-# 3. Синглтон пайплайна YuE2 и менеджер LoRA
+# 3. Синглтон пайплайна YuE2 и двойной менеджер LoRA (AR + NAR)
 # -------------------------------------------------------------
 GLOBAL_PIPE = None
 
@@ -135,34 +134,59 @@ def get_pipeline():
         GLOBAL_PIPE.synthesize = safe_synth
     return GLOBAL_PIPE
 
-def apply_lora(pipe, lora_filename, scale=1.0):
-    """Подключает LoRA к пайплайну YuE2"""
-    if not lora_filename:
-        return False
-    lora_path = LORAS_DIR / lora_filename
-    if not lora_path.exists():
-        return False
-    
-    try:
-        if hasattr(pipe, "load_lora_weights"):
-            pipe.load_lora_weights(str(lora_path), adapter_name="custom_lora")
-            if hasattr(pipe, "set_adapters"):
-                pipe.set_adapters(["custom_lora"], adapter_weights=[float(scale)])
-            return True
-        elif hasattr(pipe, "model") and PeftModel is not None:
-            pipe.model = PeftModel.from_pretrained(pipe.model, str(lora_path), adapter_name="custom_lora")
-            return True
-    except Exception as e:
-        print(f"[LoRA Warning] Не удалось загрузить {lora_filename}: {e}")
-    return False
+def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
+    """Подключает вокальную LoRA к AR и стилевую LoRA к NAR"""
+    loaded = {"vocal": False, "style": False}
 
-def remove_lora(pipe):
-    """Выгружает LoRA и восстанавливает базовую модель"""
+    # 1. Применение вокальной LoRA к AR языковому модулю
+    if vocal_lora:
+        v_path = LORAS_DIR / vocal_lora
+        if v_path.exists():
+            try:
+                target_ar = getattr(pipe, "model", None) or getattr(pipe, "ar_model", None)
+                if target_ar and PeftModel is not None:
+                    target_ar = PeftModel.from_pretrained(target_ar, str(v_path), adapter_name="vocal_adapter")
+                    target_ar.set_adapter("vocal_adapter")
+                    loaded["vocal"] = True
+                elif hasattr(pipe, "load_lora_weights"):
+                    pipe.load_lora_weights(str(v_path), adapter_name="vocal_adapter")
+                    if hasattr(pipe, "set_adapters"):
+                        pipe.set_adapters(["vocal_adapter"], adapter_weights=[float(vocal_scale)])
+                    loaded["vocal"] = True
+            except Exception as e:
+                print(f"[LoRA Error] Ошибка загрузки вокальной LoRA: {e}")
+
+    # 2. Применение стилевой LoRA к NAR диффузионному модулю
+    if style_lora:
+        s_path = LORAS_DIR / style_lora
+        if s_path.exists():
+            try:
+                target_nar = getattr(pipe, "nar", None) or getattr(pipe, "nar_model", None)
+                if target_nar and PeftModel is not None:
+                    target_nar = PeftModel.from_pretrained(target_nar, str(s_path), adapter_name="style_adapter")
+                    target_nar.set_adapter("style_adapter")
+                    loaded["style"] = True
+                elif hasattr(pipe, "load_lora_weights"):
+                    pipe.load_lora_weights(str(s_path), adapter_name="style_adapter")
+                    if hasattr(pipe, "set_adapters"):
+                        pipe.set_adapters(["style_adapter"], adapter_weights=[float(style_scale)])
+                    loaded["style"] = True
+            except Exception as e:
+                print(f"[LoRA Error] Ошибка загрузки стилевой LoRA: {e}")
+
+    return loaded
+
+def remove_dual_loras(pipe):
+    """Очищает адаптеры и возвращает базовую модель"""
     try:
         if hasattr(pipe, "unload_lora_weights"):
             pipe.unload_lora_weights()
-        elif hasattr(pipe, "delete_adapter"):
-            pipe.delete_adapter("custom_lora")
+        target_ar = getattr(pipe, "model", None) or getattr(pipe, "ar_model", None)
+        if target_ar and hasattr(target_ar, "unload"):
+            target_ar.unload()
+        target_nar = getattr(pipe, "nar", None) or getattr(pipe, "nar_model", None)
+        if target_nar and hasattr(target_nar, "unload"):
+            target_nar.unload()
     except Exception:
         pass
 
@@ -314,17 +338,19 @@ def generation_worker():
         CURRENT_TASK_IS_FAST = task.get("fast_mode", True)
         start_time = time.time()
         pipe = None
-        lora_loaded = False
+        loras_status = {"vocal": False, "style": False}
 
         try:
             pipe = get_pipeline()
 
-            # Применение LoRA если выбрана
-            lora_file = task.get("lora_file")
-            lora_scale = float(task.get("lora_scale", 0.8))
-            if lora_file:
-                current_task["progress_msg"] = f"Подключение адаптера LoRA ({lora_file})..."
-                lora_loaded = apply_lora(pipe, lora_file, lora_scale)
+            vocal_lora = task.get("vocal_lora")
+            vocal_scale = float(task.get("vocal_scale", 0.8))
+            style_lora = task.get("style_lora")
+            style_scale = float(task.get("style_scale", 0.8))
+
+            if vocal_lora or style_lora:
+                current_task["progress_msg"] = "Применение адаптеров LoRA (Вокал/Стиль)..."
+                loras_status = apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale)
 
             style = task["style"]
             if task.get("is_instrumental", False):
@@ -413,8 +439,10 @@ def generation_worker():
                 "fast_mode": CURRENT_TASK_IS_FAST,
                 "is_instrumental": task.get("is_instrumental", False),
                 "reference_audio": audio_file,
-                "lora": lora_file if lora_loaded else None,
-                "lora_scale": lora_scale if lora_loaded else None,
+                "vocal_lora": vocal_lora if loras_status["vocal"] else None,
+                "vocal_scale": vocal_scale if loras_status["vocal"] else None,
+                "style_lora": style_lora if loras_status["style"] else None,
+                "style_scale": style_scale if loras_status["style"] else None,
                 "has_abc": True,
                 "is_midi_gen": bool(task.get("midi_source", False)),
                 "filename": filename,
@@ -433,8 +461,8 @@ def generation_worker():
             current_task["error"] = str(e)
             current_task["progress_msg"] = f"Ошибка: {str(e)}"
         finally:
-            if pipe and lora_loaded:
-                remove_lora(pipe)
+            if pipe and (loras_status["vocal"] or loras_status["style"]):
+                remove_dual_loras(pipe)
             if device == "cuda":
                 torch.cuda.empty_cache()
             elif device == "mps":
@@ -856,8 +884,10 @@ class StudioHandler(SimpleHTTPRequestHandler):
                 "audio_file": data.get("audio_file", None),
                 "abc_score": data.get("abc_score", ""),
                 "midi_source": bool(data.get("midi_source", False)),
-                "lora_file": data.get("lora_file", None),
-                "lora_scale": float(data.get("lora_scale", 0.8))
+                "vocal_lora": data.get("vocal_lora", None),
+                "vocal_scale": float(data.get("vocal_scale", 0.8)),
+                "style_lora": data.get("style_lora", None),
+                "style_scale": float(data.get("style_scale", 0.8))
             }
             task_queue.put(task_item)
 
