@@ -134,61 +134,155 @@ def get_pipeline():
         GLOBAL_PIPE.synthesize = safe_synth
     return GLOBAL_PIPE
 
+
+
+LORA_STATE = {
+    "ar_attr": None,       # имя атрибута в pipe, напр. "model"
+    "ar_original": None,   # исходный (базовый) модуль
+    "nar_attr": None,
+    "nar_original": None,
+}
+
+# Возможные имена атрибутов AR/NAR в разных сборках yue2_infer
+_AR_CANDIDATES  = ("model", "ar_model", "ar", "language_model", "ar_lm", "lm", "text_model")
+_NAR_CANDIDATES = ("nar", "nar_model", "nar_diffusion", "diffusion", "diffusion_model", "vae_model")
+
+
+def _find_pipe_module(pipe, candidates):
+    """
+    Возвращает (attr_name, module) для первого существующего и не-None
+    атрибута из candidates, у которого есть .parameters() (т.е. это nn.Module).
+    """
+    for name in candidates:
+        if not hasattr(pipe, name):
+            continue
+        val = getattr(pipe, name)
+        if val is None:
+            continue
+        if hasattr(val, "parameters"):
+            return name, val
+    return None, None
+
+
+def _scale_lora_adapter(peft_model, adapter_name, user_scale):
+    """
+    Применяет пользовательский масштаб к уже активированному адаптеру.
+    Умножает существующий scaling[adapter_name] (обычно lora_alpha / r) на user_scale.
+    """
+    try:
+        user_scale = float(user_scale)
+    except (TypeError, ValueError):
+        return
+
+    touched = 0
+    for module in peft_model.modules():
+        scaling = getattr(module, "scaling", None)
+        if isinstance(scaling, dict) and adapter_name in scaling:
+            scaling[adapter_name] = float(scaling[adapter_name]) * user_scale
+            touched += 1
+    if touched == 0:
+        print(f"[LoRA] Не найдено LoRA-слоёв для адаптера '{adapter_name}' — scale не применён.")
+
+
+def _attach_lora(module, lora_path, adapter_name, scale):
+    """
+    Прикрепляет LoRA-адаптер к module и возвращает новый PeftModel.
+    Корректно обрабатывает случай, когда module уже является PeftModel.
+    """
+    if PeftModel is None:
+        raise RuntimeError("peft не установлен. Установите: pip install peft")
+
+    if isinstance(module, PeftModel):
+        # Модель уже PEFT — просто добавляем/переключаем адаптер
+        existing = getattr(module, "peft_config", {}) or {}
+        if adapter_name in existing:
+            module.set_adapter(adapter_name)
+        else:
+            module.load_adapter(str(lora_path), adapter_name=adapter_name)
+            module.set_adapter(adapter_name)
+        peft_model = module
+    else:
+        peft_model = PeftModel.from_pretrained(
+            module, str(lora_path), adapter_name=adapter_name
+        )
+        peft_model.set_adapter(adapter_name)
+
+    _scale_lora_adapter(peft_model, adapter_name, scale)
+    return peft_model
+
+
 def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
-    """Подключает вокальную LoRA к AR и стилевую LoRA к NAR"""
+    """Подключает вокальную LoRA к AR и стилевую LoRA к NAR."""
     loaded = {"vocal": False, "style": False}
 
-    # 1. Применение вокальной LoRA к AR языковому модулю
+    # --- Вокальная LoRA → AR ---
     if vocal_lora:
         v_path = LORAS_DIR / vocal_lora
-        if v_path.exists():
-            try:
-                target_ar = getattr(pipe, "model", None) or getattr(pipe, "ar_model", None)
-                if target_ar and PeftModel is not None:
-                    target_ar = PeftModel.from_pretrained(target_ar, str(v_path), adapter_name="vocal_adapter")
-                    target_ar.set_adapter("vocal_adapter")
+        if not v_path.exists():
+            print(f"[LoRA] Файл не найден: {v_path}")
+        else:
+            ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
+            if ar_base is None:
+                print(f"[LoRA] AR-модуль не найден в pipe (проверены: {_AR_CANDIDATES})")
+            else:
+                try:
+                    peft_ar = _attach_lora(ar_base, v_path, "vocal_adapter", vocal_scale)
+                    setattr(pipe, ar_attr, peft_ar)   # ← ГЛАВНЫЙ ФИКС
+                    LORA_STATE["ar_attr"] = ar_attr
+                    LORA_STATE["ar_original"] = ar_base
                     loaded["vocal"] = True
-                elif hasattr(pipe, "load_lora_weights"):
-                    pipe.load_lora_weights(str(v_path), adapter_name="vocal_adapter")
-                    if hasattr(pipe, "set_adapters"):
-                        pipe.set_adapters(["vocal_adapter"], adapter_weights=[float(vocal_scale)])
-                    loaded["vocal"] = True
-            except Exception as e:
-                print(f"[LoRA Error] Ошибка загрузки вокальной LoRA: {e}")
+                    print(f"[LoRA] Вокальная LoRA '{vocal_lora}' → pipe.{ar_attr} (scale={vocal_scale})")
+                except Exception as e:
+                    print(f"[LoRA Error] Вокальная LoRA: {e}")
 
-    # 2. Применение стилевой LoRA к NAR диффузионному модулю
+    # --- Стилевая LoRA → NAR ---
     if style_lora:
         s_path = LORAS_DIR / style_lora
-        if s_path.exists():
-            try:
-                target_nar = getattr(pipe, "nar", None) or getattr(pipe, "nar_model", None)
-                if target_nar and PeftModel is not None:
-                    target_nar = PeftModel.from_pretrained(target_nar, str(s_path), adapter_name="style_adapter")
-                    target_nar.set_adapter("style_adapter")
+        if not s_path.exists():
+            print(f"[LoRA] Файл не найден: {s_path}")
+        else:
+            nar_attr, nar_base = _find_pipe_module(pipe, _NAR_CANDIDATES)
+            if nar_base is None:
+                print(f"[LoRA] NAR-модуль не найден в pipe (проверены: {_NAR_CANDIDATES})")
+            else:
+                try:
+                    peft_nar = _attach_lora(nar_base, s_path, "style_adapter", style_scale)
+                    setattr(pipe, nar_attr, peft_nar)  # ← ГЛАВНЫЙ ФИКС
+                    LORA_STATE["nar_attr"] = nar_attr
+                    LORA_STATE["nar_original"] = nar_base
                     loaded["style"] = True
-                elif hasattr(pipe, "load_lora_weights"):
-                    pipe.load_lora_weights(str(s_path), adapter_name="style_adapter")
-                    if hasattr(pipe, "set_adapters"):
-                        pipe.set_adapters(["style_adapter"], adapter_weights=[float(style_scale)])
-                    loaded["style"] = True
-            except Exception as e:
-                print(f"[LoRA Error] Ошибка загрузки стилевой LoRA: {e}")
+                    print(f"[LoRA] Стилевая LoRA '{style_lora}' → pipe.{nar_attr} (scale={style_scale})")
+                except Exception as e:
+                    print(f"[LoRA Error] Стилевая LoRA: {e}")
 
     return loaded
 
+
 def remove_dual_loras(pipe):
-    """Очищает адаптеры и возвращает базовую модель"""
-    try:
-        if hasattr(pipe, "unload_lora_weights"):
-            pipe.unload_lora_weights()
-        target_ar = getattr(pipe, "model", None) or getattr(pipe, "ar_model", None)
-        if target_ar and hasattr(target_ar, "unload"):
-            target_ar.unload()
-        target_nar = getattr(pipe, "nar", None) or getattr(pipe, "nar_model", None)
-        if target_nar and hasattr(target_nar, "unload"):
-            target_nar.unload()
-    except Exception:
-        pass
+    """Возвращает базовые модули на место, откатывая LoRA."""
+    for target in ("ar", "nar"):
+        attr     = LORA_STATE.get(f"{target}_attr")
+        original = LORA_STATE.get(f"{target}_original")
+        if not attr or original is None:
+            continue
+        try:
+            current = getattr(pipe, attr, None)
+            if isinstance(current, PeftModel):
+                # Пытаемся корректно отгрузить адаптеры (не критично, если не сработает)
+                try:
+                    if hasattr(current, "unload"):
+                        current.unload()
+                except Exception:
+                    pass
+            # Возвращаем базовый модуль
+            setattr(pipe, attr, original)
+            print(f"[LoRA] Восстановлен pipe.{attr} (базовый модуль)")
+        except Exception as e:
+            print(f"[LoRA Error] Откат {target}: {e}")
+        finally:
+            LORA_STATE[f"{target}_attr"] = None
+            LORA_STATE[f"{target}_original"] = None
+
 
 # -------------------------------------------------------------
 # 4. База данных JSON и файлы LoRA
@@ -623,6 +717,29 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(list_available_loras()).encode("utf-8"))
+            return
+
+        # [LORA FIX] Диагностический эндпоинт — помогает понять, какие атрибуты есть в pipe
+        if parsed.path == "/api/loras/debug":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            info = {"pipe_loaded": GLOBAL_PIPE is not None, "attributes": {}, "lora_state": {}}
+            if GLOBAL_PIPE is not None:
+                for name in dir(GLOBAL_PIPE):
+                    if name.startswith("_"):
+                        continue
+                    try:
+                        val = getattr(GLOBAL_PIPE, name)
+                        if hasattr(val, "parameters"):
+                            info["attributes"][name] = type(val).__name__
+                    except Exception:
+                        pass
+            info["lora_state"] = {
+                k: (type(v).__name__ if v is not None else None)
+                for k, v in LORA_STATE.items()
+            }
+            self.wfile.write(json.dumps(info, ensure_ascii=False).encode("utf-8"))
             return
 
         if parsed.path == "/api/status":
