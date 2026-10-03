@@ -9,9 +9,6 @@ from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-# -------------------------------------------------------------
-# 1. Настройка путей и окружения
-# -------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_CACHE_DIR = BASE_DIR / "models_cache"
 MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,9 +60,16 @@ try:
 except ImportError:
     PeftModel = None
 
-# -------------------------------------------------------------
-# 2. Оптимизация памяти NAR под 16GB VRAM и безопасный FAST-патчинг
-# -------------------------------------------------------------
+def safe_resolve(base_dir: Path, subpath: str) -> Path:
+    cleaned = Path(subpath).name
+    target = (base_dir / cleaned).resolve()
+    if not target.is_relative_to(base_dir.resolve()):
+        raise PermissionError("Access denied")
+    return target
+
+def safe_track_id(tid: str) -> str:
+    return "".join(c for c in str(tid) if c.isalnum() or c in ("_", "-"))
+
 ORIG_CACHED_NAR_INIT = yue_nar.CachedNAR.__init__
 
 def patched_cached_nar_init(self, model, chunk, attention, query_chunk_size=None, *args, **kwargs):
@@ -100,6 +104,7 @@ def safe_fast_generate_tokens(model, prefix, sampling, seed, phase, *args, **kwa
 yue_sampling.generate_tokens = safe_fast_generate_tokens
 
 task_queue = queue.Queue()
+task_lock = threading.Lock()
 current_task = {
     "status": "idle",
     "progress_msg": "",
@@ -107,15 +112,20 @@ current_task = {
     "error": None
 }
 
-# -------------------------------------------------------------
-# 3. Синглтон пайплайна YuE2 и двойной менеджер LoRA (AR + NAR)
-# -------------------------------------------------------------
+def set_task_state(**kwargs):
+    with task_lock:
+        current_task.update(kwargs)
+
+def get_task_state():
+    with task_lock:
+        return dict(current_task)
+
 GLOBAL_PIPE = None
 
 def get_pipeline():
     global GLOBAL_PIPE
     if GLOBAL_PIPE is None:
-        current_task["progress_msg"] = f"Загрузка весов YuE2-3B в память ({device.upper()})..."
+        set_task_state(progress_msg=f"Загрузка весов YuE2-3B в память ({device.upper()})...")
         GLOBAL_PIPE = YuE2Pipeline.from_pretrained(
             "m-a-p/YuE2-3B",
             vae="m-a-p/YuE2-Vae",
@@ -134,25 +144,17 @@ def get_pipeline():
         GLOBAL_PIPE.synthesize = safe_synth
     return GLOBAL_PIPE
 
-
-
 LORA_STATE = {
-    "ar_attr": None,       # имя атрибута в pipe, напр. "model"
-    "ar_original": None,   # исходный (базовый) модуль
+    "ar_attr": None,
+    "ar_original": None,
     "nar_attr": None,
     "nar_original": None,
 }
 
-# Возможные имена атрибутов AR/NAR в разных сборках yue2_infer
-_AR_CANDIDATES  = ("model", "ar_model", "ar", "language_model", "ar_lm", "lm", "text_model")
+_AR_CANDIDATES = ("model", "ar_model", "ar", "language_model", "ar_lm", "lm", "text_model")
 _NAR_CANDIDATES = ("nar", "nar_model", "nar_diffusion", "diffusion", "diffusion_model", "vae_model")
 
-
 def _find_pipe_module(pipe, candidates):
-    """
-    Возвращает (attr_name, module) для первого существующего и не-None
-    атрибута из candidates, у которого есть .parameters() (т.е. это nn.Module).
-    """
     for name in candidates:
         if not hasattr(pipe, name):
             continue
@@ -163,130 +165,133 @@ def _find_pipe_module(pipe, candidates):
             return name, val
     return None, None
 
-
 def _scale_lora_adapter(peft_model, adapter_name, user_scale):
-    """
-    Применяет пользовательский масштаб к уже активированному адаптеру.
-    Умножает существующий scaling[adapter_name] (обычно lora_alpha / r) на user_scale.
-    """
     try:
         user_scale = float(user_scale)
     except (TypeError, ValueError):
         return
-
-    touched = 0
     for module in peft_model.modules():
+        if hasattr(module, "set_scale"):
+            try:
+                module.set_scale(adapter_name, user_scale)
+                continue
+            except Exception:
+                pass
         scaling = getattr(module, "scaling", None)
         if isinstance(scaling, dict) and adapter_name in scaling:
-            scaling[adapter_name] = float(scaling[adapter_name]) * user_scale
-            touched += 1
-    if touched == 0:
-        print(f"[LoRA] Не найдено LoRA-слоёв для адаптера '{adapter_name}' — scale не применён.")
+            r_val = getattr(module, "r", 16)
+            if isinstance(r_val, dict):
+                r_val = r_val.get(adapter_name, 16)
+            alpha_val = getattr(module, "lora_alpha", 32)
+            if isinstance(alpha_val, dict):
+                alpha_val = alpha_val.get(adapter_name, 32)
+            base_ratio = float(alpha_val) / float(r_val) if r_val else 1.0
+            scaling[adapter_name] = base_ratio * user_scale
 
+def _prepare_lora_path(lora_path: Path, adapter_name: str) -> Path:
+    if lora_path.is_dir():
+        return lora_path
+    target_dir = lora_path.parent / f"_peft_{lora_path.stem}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = target_dir / "adapter_config.json"
+    if not cfg_path.exists():
+        is_nar = "nar" in adapter_name.lower() or "style" in adapter_name.lower()
+        target_modules = ["to_q", "to_k", "to_v", "to_out.0"] if is_nar else ["q_proj", "v_proj", "k_proj", "o_proj"]
+        cfg_dict = {
+            "peft_type": "LORA",
+            "r": 16,
+            "lora_alpha": 32,
+            "target_modules": target_modules,
+            "lora_dropout": 0.05,
+            "bias": "none",
+            "task_type": None if is_nar else "CAUSAL_LM"
+        }
+        cfg_path.write_text(json.dumps(cfg_dict, indent=2), encoding="utf-8")
+    weight_target = target_dir / f"adapter_model{lora_path.suffix}"
+    if not weight_target.exists() or weight_target.stat().st_size != lora_path.stat().st_size:
+        try:
+            shutil.copyfile(lora_path, weight_target)
+        except Exception:
+            pass
+    return target_dir
 
-def _attach_lora(module, lora_path, adapter_name, scale):
-    """
-    Прикрепляет LoRA-адаптер к module и возвращает новый PeftModel.
-    Корректно обрабатывает случай, когда module уже является PeftModel.
-    """
+def _attach_lora(module, lora_path: Path, adapter_name: str, scale: float):
     if PeftModel is None:
-        raise RuntimeError("peft не установлен. Установите: pip install peft")
-
+        raise RuntimeError("peft не установлен")
+    ready_path = _prepare_lora_path(lora_path, adapter_name)
     if isinstance(module, PeftModel):
-        # Модель уже PEFT — просто добавляем/переключаем адаптер
-        existing = getattr(module, "peft_config", {}) or {}
-        if adapter_name in existing:
-            module.set_adapter(adapter_name)
-        else:
-            module.load_adapter(str(lora_path), adapter_name=adapter_name)
-            module.set_adapter(adapter_name)
+        peft_config = getattr(module, "peft_config", {}) or {}
+        if adapter_name in peft_config:
+            try:
+                module.delete_adapter(adapter_name)
+            except Exception:
+                pass
+        module.load_adapter(str(ready_path), adapter_name=adapter_name)
+        module.set_adapter(adapter_name)
         peft_model = module
     else:
-        peft_model = PeftModel.from_pretrained(
-            module, str(lora_path), adapter_name=adapter_name
-        )
+        peft_model = PeftModel.from_pretrained(module, str(ready_path), adapter_name=adapter_name)
         peft_model.set_adapter(adapter_name)
-
     _scale_lora_adapter(peft_model, adapter_name, scale)
     return peft_model
 
-
 def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
-    """Подключает вокальную LoRA к AR и стилевую LoRA к NAR."""
     loaded = {"vocal": False, "style": False}
 
-    # --- Вокальная LoRA → AR ---
     if vocal_lora:
-        v_path = LORAS_DIR / vocal_lora
-        if not v_path.exists():
-            print(f"[LoRA] Файл не найден: {v_path}")
-        else:
-            ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
-            if ar_base is None:
-                print(f"[LoRA] AR-модуль не найден в pipe (проверены: {_AR_CANDIDATES})")
-            else:
-                try:
+        try:
+            v_path = safe_resolve(LORAS_DIR, vocal_lora)
+            if v_path.exists():
+                ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
+                if ar_base is not None:
                     peft_ar = _attach_lora(ar_base, v_path, "vocal_adapter", vocal_scale)
-                    setattr(pipe, ar_attr, peft_ar)   # ← ГЛАВНЫЙ ФИКС
+                    setattr(pipe, ar_attr, peft_ar)
                     LORA_STATE["ar_attr"] = ar_attr
                     LORA_STATE["ar_original"] = ar_base
                     loaded["vocal"] = True
-                    print(f"[LoRA] Вокальная LoRA '{vocal_lora}' → pipe.{ar_attr} (scale={vocal_scale})")
-                except Exception as e:
-                    print(f"[LoRA Error] Вокальная LoRA: {e}")
+        except Exception as e:
+            print(f"[LoRA Error] Вокальная LoRA: {e}")
 
-    # --- Стилевая LoRA → NAR ---
     if style_lora:
-        s_path = LORAS_DIR / style_lora
-        if not s_path.exists():
-            print(f"[LoRA] Файл не найден: {s_path}")
-        else:
-            nar_attr, nar_base = _find_pipe_module(pipe, _NAR_CANDIDATES)
-            if nar_base is None:
-                print(f"[LoRA] NAR-модуль не найден в pipe (проверены: {_NAR_CANDIDATES})")
-            else:
-                try:
+        try:
+            s_path = safe_resolve(LORAS_DIR, style_lora)
+            if s_path.exists():
+                nar_attr, nar_base = _find_pipe_module(pipe, _NAR_CANDIDATES)
+                if nar_base is not None:
                     peft_nar = _attach_lora(nar_base, s_path, "style_adapter", style_scale)
-                    setattr(pipe, nar_attr, peft_nar)  # ← ГЛАВНЫЙ ФИКС
+                    setattr(pipe, nar_attr, peft_nar)
                     LORA_STATE["nar_attr"] = nar_attr
                     LORA_STATE["nar_original"] = nar_base
                     loaded["style"] = True
-                    print(f"[LoRA] Стилевая LoRA '{style_lora}' → pipe.{nar_attr} (scale={style_scale})")
-                except Exception as e:
-                    print(f"[LoRA Error] Стилевая LoRA: {e}")
+        except Exception as e:
+            print(f"[LoRA Error] Стилевая LoRA: {e}")
 
     return loaded
 
-
 def remove_dual_loras(pipe):
-    """Возвращает базовые модули на место, откатывая LoRA."""
     for target in ("ar", "nar"):
-        attr     = LORA_STATE.get(f"{target}_attr")
+        attr = LORA_STATE.get(f"{target}_attr")
         original = LORA_STATE.get(f"{target}_original")
         if not attr or original is None:
             continue
         try:
             current = getattr(pipe, attr, None)
             if isinstance(current, PeftModel):
-                # Пытаемся корректно отгрузить адаптеры (не критично, если не сработает)
                 try:
-                    if hasattr(current, "unload"):
-                        current.unload()
+                    if hasattr(current, "disable_adapters"):
+                        current.disable_adapters()
+                    unloaded = current.unload()
+                    setattr(pipe, attr, unloaded)
                 except Exception:
-                    pass
-            # Возвращаем базовый модуль
+                    setattr(pipe, attr, original)
+            else:
+                setattr(pipe, attr, original)
+        except Exception:
             setattr(pipe, attr, original)
-            print(f"[LoRA] Восстановлен pipe.{attr} (базовый модуль)")
-        except Exception as e:
-            print(f"[LoRA Error] Откат {target}: {e}")
         finally:
             LORA_STATE[f"{target}_attr"] = None
             LORA_STATE[f"{target}_original"] = None
 
-
-# -------------------------------------------------------------
-# 4. База данных JSON и файлы LoRA
-# -------------------------------------------------------------
 DEFAULT_PRESETS = [
     {
         "id": "p_industrial_metal",
@@ -360,12 +365,23 @@ def save_history(history):
 
 def list_available_loras():
     loras = []
-    for file in LORAS_DIR.glob("*.*"):
-        if file.suffix.lower() in [".safetensors", ".bin", ".pt"]:
-            size_mb = round(file.stat().st_size / (1024 * 1024), 1)
+    for item in sorted(LORAS_DIR.iterdir()):
+        if item.name.startswith((".", "_")):
+            continue
+        if item.is_dir():
+            weights = [f for f in item.iterdir() if f.suffix.lower() in (".safetensors", ".bin", ".pt")]
+            if weights or (item / "adapter_config.json").exists():
+                size_mb = round(sum(f.stat().st_size for f in weights) / (1024 * 1024), 1) if weights else 0.0
+                loras.append({
+                    "filename": item.name,
+                    "name": item.name.replace("_", " ").title(),
+                    "size": f"{size_mb} MB"
+                })
+        elif item.is_file() and item.suffix.lower() in (".safetensors", ".bin", ".pt"):
+            size_mb = round(item.stat().st_size / (1024 * 1024), 1)
             loras.append({
-                "filename": file.name,
-                "name": file.stem.replace("_", " ").title(),
+                "filename": item.name,
+                "name": item.stem.replace("_", " ").title(),
                 "size": f"{size_mb} MB"
             })
     return loras
@@ -413,21 +429,15 @@ def generate_fallback_abc(title, style, lyrics):
     ]
     return "\n".join(abc_lines)
 
-# -------------------------------------------------------------
-# 5. Фоновый воркер инференса
-# -------------------------------------------------------------
 def generation_worker():
-    global current_task, CURRENT_TASK_IS_FAST
+    global CURRENT_TASK_IS_FAST
     while True:
         task = task_queue.get()
         if task is None:
             break
 
         task_id = task["id"]
-        current_task["status"] = "running"
-        current_task["task_id"] = task_id
-        current_task["progress_msg"] = "Подготовка параметров генерации..."
-        current_task["error"] = None
+        set_task_state(status="running", task_id=task_id, progress_msg="Подготовка параметров генерации...", error=None)
 
         CURRENT_TASK_IS_FAST = task.get("fast_mode", True)
         start_time = time.time()
@@ -443,7 +453,7 @@ def generation_worker():
             style_scale = float(task.get("style_scale", 0.8))
 
             if vocal_lora or style_lora:
-                current_task["progress_msg"] = "Применение адаптеров LoRA (Вокал/Стиль)..."
+                set_task_state(progress_msg="Применение адаптеров LoRA (Вокал/Стиль)...")
                 loras_status = apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale)
 
             style = task["style"]
@@ -467,19 +477,19 @@ def generation_worker():
             }
 
             if custom_abc:
-                current_task["progress_msg"] = "Синтез по партитуре (MIDI/ABC)..."
+                set_task_state(progress_msg="Синтез по партитуре (MIDI/ABC)...")
                 gen_kwargs["abc"] = sanitize_abc_notation(custom_abc, task.get("title") or "Track")
                 gen_kwargs["cot"] = "melody"
             else:
                 chosen_cot = "melody" if audio_file else task.get("cot", "full")
-                current_task["progress_msg"] = f"Символическое планирование (cot='{chosen_cot}')..."
+                set_task_state(progress_msg=f"Символическое планирование (cot='{chosen_cot}')...")
                 gen_kwargs["cot"] = chosen_cot
 
             song = pipe(**gen_kwargs)
 
-            current_task["progress_msg"] = "Сохранение аудио и нотных артефактов..."
+            set_task_state(progress_msg="Сохранение аудио и нотных артефактов...")
             filename = f"track_{task_id}.flac"
-            file_path = TRACKS_DIR / filename
+            file_path = safe_resolve(TRACKS_DIR, filename)
 
             if hasattr(song, "save"):
                 song.save(str(file_path))
@@ -491,7 +501,8 @@ def generation_worker():
                     audio_data = audio_data.T
                 sf.write(str(file_path), audio_data, 48000)
 
-            track_artifacts_dir = ARTIFACTS_BASE_DIR / task_id
+            clean_tid = safe_track_id(task_id)
+            track_artifacts_dir = safe_resolve(ARTIFACTS_BASE_DIR, clean_tid)
             track_artifacts_dir.mkdir(parents=True, exist_ok=True)
             target_score_file = track_artifacts_dir / "score.abc"
 
@@ -547,13 +558,10 @@ def generation_worker():
             })
             save_history(history)
 
-            current_task["status"] = "completed"
-            current_task["progress_msg"] = f"Готово за {duration_sec} сек!"
+            set_task_state(status="completed", progress_msg=f"Готово за {duration_sec} сек!")
 
         except Exception as e:
-            current_task["status"] = "error"
-            current_task["error"] = str(e)
-            current_task["progress_msg"] = f"Ошибка: {str(e)}"
+            set_task_state(status="error", error=str(e), progress_msg=f"Ошибка: {str(e)}")
         finally:
             if pipe and (loras_status["vocal"] or loras_status["style"]):
                 remove_dual_loras(pipe)
@@ -566,9 +574,6 @@ def generation_worker():
 
 threading.Thread(target=generation_worker, daemon=True).start()
 
-# -------------------------------------------------------------
-# 6. HTTP API сервер
-# -------------------------------------------------------------
 class StudioHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -597,46 +602,66 @@ class StudioHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path.startswith("/audio/"):
-            filename = parsed.path.replace("/audio/", "")
-            file_path = TRACKS_DIR / filename
-            if not file_path.exists():
+            raw_filename = parsed.path.replace("/audio/", "")
+            try:
+                file_path = safe_resolve(TRACKS_DIR, raw_filename)
+            except PermissionError:
+                self.send_error(403, "Forbidden")
+                return
+
+            if not file_path.exists() or not file_path.is_file():
                 self.send_error(404, "Audio not found")
                 return
 
             file_size = file_path.stat().st_size
             range_header = self.headers.get("Range")
 
-            if range_header:
-                byte_range = range_header.strip().split("=")[-1]
-                start_str, end_str = byte_range.split("-")
-                start = int(start_str) if start_str else 0
-                end = int(end_str) if end_str else file_size - 1
-                length = end - start + 1
+            if range_header and range_header.startswith("bytes="):
+                byte_range = range_header.split("=")[1].strip()
+                if "," not in byte_range:
+                    if byte_range.startswith("-"):
+                        suffix_len = int(byte_range[1:])
+                        start = max(0, file_size - suffix_len)
+                        end = file_size - 1
+                    elif byte_range.endswith("-"):
+                        start = int(byte_range[:-1])
+                        end = file_size - 1
+                    else:
+                        parts = byte_range.split("-")
+                        start = int(parts[0])
+                        end = min(file_size - 1, int(parts[1]))
 
-                self.send_response(206)
-                self.send_header("Content-Type", "audio/flac")
-                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-                self.send_header("Content-Length", str(length))
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
+                    if start <= end and start < file_size:
+                        length = end - start + 1
+                        self.send_response(206)
+                        self.send_header("Content-Type", "audio/flac")
+                        self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                        self.send_header("Content-Length", str(length))
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.end_headers()
+                        with open(file_path, "rb") as f:
+                            f.seek(start)
+                            self.wfile.write(f.read(length))
+                        return
 
-                with open(file_path, "rb") as f:
-                    f.seek(start)
-                    self.wfile.write(f.read(length))
-                return
-            else:
-                self.send_response(200)
-                self.send_header("Content-Type", "audio/flac")
-                self.send_header("Content-Length", str(file_size))
-                self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
-                with open(file_path, "rb") as f:
-                    self.wfile.write(f.read())
-                return
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/flac")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            with open(file_path, "rb") as f:
+                self.wfile.write(f.read())
+            return
 
         if parsed.path == "/api/score":
-            track_id = qs.get("id", [""])[0]
-            track_artifacts_dir = ARTIFACTS_BASE_DIR / track_id
+            raw_id = qs.get("id", [""])[0]
+            clean_id = safe_track_id(raw_id)
+            try:
+                track_artifacts_dir = safe_resolve(ARTIFACTS_BASE_DIR, clean_id)
+            except PermissionError:
+                self.send_error(403, "Forbidden")
+                return
+
             score_file = track_artifacts_dir / "score.abc"
 
             if not score_file.exists():
@@ -648,7 +673,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
                 abc_content = score_file.read_text(encoding="utf-8", errors="ignore")
             else:
                 history = load_history()
-                item = next((x for x in history if x["id"] == track_id), None)
+                item = next((x for x in history if x["id"] == raw_id), None)
                 abc_content = generate_fallback_abc(
                     item.get("title") if item else "Track",
                     item.get("style") if item else "pop",
@@ -664,8 +689,14 @@ class StudioHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/midi":
-            track_id = qs.get("id", [""])[0]
-            track_artifacts_dir = ARTIFACTS_BASE_DIR / track_id
+            raw_id = qs.get("id", [""])[0]
+            clean_id = safe_track_id(raw_id)
+            try:
+                track_artifacts_dir = safe_resolve(ARTIFACTS_BASE_DIR, clean_id)
+            except PermissionError:
+                self.send_error(403, "Forbidden")
+                return
+
             track_artifacts_dir.mkdir(parents=True, exist_ok=True)
             score_file = track_artifacts_dir / "score.abc"
             midi_file = track_artifacts_dir / "score.mid"
@@ -676,7 +707,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
                     shutil.copyfile(found[0], score_file)
                 else:
                     history = load_history()
-                    item = next((x for x in history if x["id"] == track_id), None)
+                    item = next((x for x in history if x["id"] == raw_id), None)
                     fallback_text = generate_fallback_abc(
                         item.get("title") if item else "Track",
                         item.get("style") if item else "pop",
@@ -690,8 +721,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
                         abc_txt = score_file.read_text(encoding="utf-8", errors="ignore")
                         parsed_score = m21_converter.parse(abc_txt, format="abc")
                         parsed_score.write("midi", fp=str(midi_file))
-                    except Exception as err:
-                        print(f"[Предупреждение] music21 не смог разобрать ABC: {err}")
+                    except Exception:
                         try:
                             clean_fallback = generate_fallback_abc("Track", "120 bpm", "")
                             parsed_score = m21_converter.parse(clean_fallback, format="abc")
@@ -706,7 +736,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             midi_bytes = midi_file.read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", "audio/midi")
-            self.send_header("Content-Disposition", f'attachment; filename="track_{track_id}.mid"')
+            self.send_header("Content-Disposition", f'attachment; filename="track_{clean_id}.mid"')
             self.send_header("Content-Length", str(len(midi_bytes)))
             self.end_headers()
             self.wfile.write(midi_bytes)
@@ -719,7 +749,6 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(list_available_loras()).encode("utf-8"))
             return
 
-        # [LORA FIX] Диагностический эндпоинт — помогает понять, какие атрибуты есть в pipe
         if parsed.path == "/api/loras/debug":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -748,7 +777,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({
                 "queue_size": task_queue.qsize(),
-                "current_task": current_task
+                "current_task": get_task_state()
             }).encode("utf-8"))
             return
 
@@ -791,8 +820,8 @@ class StudioHandler(SimpleHTTPRequestHandler):
             raw_data = self.rfile.read(content_length)
 
             if "boundary=" in content_type:
-                boundary = content_type.split("boundary=")[1].encode("utf-8")
-                parts = raw_data.split(boundary)
+                boundary = content_type.split("boundary=")[1].strip().encode("utf-8")
+                parts = raw_data.split(b"--" + boundary)
                 saved_filename = None
                 is_midi = False
                 for part in parts:
@@ -807,30 +836,33 @@ class StudioHandler(SimpleHTTPRequestHandler):
                         if ext.endswith((".mp3", ".wav", ".flac", ".ogg", ".m4a", ".mid", ".midi")):
                             saved_filename = f"{int(time.time())}_{clean_fn}"
                             is_midi = ext.endswith((".mid", ".midi"))
-                            body_part = body_part.rstrip(b"\r\n--")
-                            saved_path = UPLOADS_DIR / saved_filename
+                            if body_part.endswith(b"\r\n"):
+                                body_part = body_part[:-2]
+                            if body_part.endswith(b"--"):
+                                body_part = body_part[:-2]
+                            saved_path = safe_resolve(UPLOADS_DIR, saved_filename)
                             with open(saved_path, "wb") as f:
                                 f.write(body_part)
                             break
             else:
                 saved_filename = f"file_{int(time.time())}.bin"
-                saved_path = UPLOADS_DIR / saved_filename
+                saved_path = safe_resolve(UPLOADS_DIR, saved_filename)
                 with open(saved_path, "wb") as f:
                     f.write(raw_data)
                 is_midi = False
 
             abc_content = ""
-            if is_midi and m21_converter is not None:
+            if is_midi and m21_converter is not None and saved_filename:
                 try:
-                    midi_score = m21_converter.parse(str(saved_path), format="midi")
-                    tmp_abc_path = UPLOADS_DIR / f"{saved_filename}.abc"
+                    target_file = safe_resolve(UPLOADS_DIR, saved_filename)
+                    midi_score = m21_converter.parse(str(target_file), format="midi")
+                    tmp_abc_path = safe_resolve(UPLOADS_DIR, f"{saved_filename}.abc")
                     midi_score.write("abc", fp=str(tmp_abc_path))
                     if tmp_abc_path.exists():
                         raw_abc = tmp_abc_path.read_text(encoding="utf-8", errors="ignore")
                         abc_content = sanitize_abc_notation(raw_abc, saved_filename)
                         tmp_abc_path.unlink()
-                except Exception as e:
-                    print(f"[Ошибка конвертации MIDI в ABC]: {e}")
+                except Exception:
                     abc_content = ""
 
             self.send_response(200)
@@ -851,25 +883,27 @@ class StudioHandler(SimpleHTTPRequestHandler):
             data = {}
 
         if parsed.path == "/api/tracks/delete":
-            track_id = data.get("id")
+            raw_id = data.get("id", "")
+            clean_id = safe_track_id(raw_id)
             history = load_history()
-            track_item = next((t for t in history if t["id"] == track_id), None)
+            track_item = next((t for t in history if t["id"] == raw_id), None)
             if track_item:
                 filename = track_item.get("filename")
                 if filename:
-                    flac_path = TRACKS_DIR / filename
-                    if flac_path.exists():
-                        try:
-                            flac_path.unlink()
-                        except Exception:
-                            pass
-                art_dir = ARTIFACTS_BASE_DIR / track_id
-                if art_dir.exists():
                     try:
-                        shutil.rmtree(art_dir)
+                        flac_path = safe_resolve(TRACKS_DIR, filename)
+                        if flac_path.exists():
+                            flac_path.unlink()
                     except Exception:
                         pass
-                history = [t for t in history if t["id"] != track_id]
+                if clean_id:
+                    try:
+                        art_dir = safe_resolve(ARTIFACTS_BASE_DIR, clean_id)
+                        if art_dir.exists():
+                            shutil.rmtree(art_dir)
+                    except Exception:
+                        pass
+                history = [t for t in history if t["id"] != raw_id]
                 save_history(history)
 
             self.send_response(200)
@@ -879,13 +913,19 @@ class StudioHandler(SimpleHTTPRequestHandler):
             return
 
         if parsed.path == "/api/loras/delete":
-            lora_fn = data.get("filename")
-            target_path = LORAS_DIR / lora_fn
-            if target_path.exists():
-                try:
-                    target_path.unlink()
-                except Exception:
-                    pass
+            lora_fn = data.get("filename", "")
+            try:
+                target_path = safe_resolve(LORAS_DIR, lora_fn)
+                if target_path.exists():
+                    if target_path.is_dir():
+                        shutil.rmtree(target_path)
+                    else:
+                        target_path.unlink()
+                    alt_dir = LORAS_DIR / f"_peft_{target_path.stem}"
+                    if alt_dir.exists():
+                        shutil.rmtree(alt_dir)
+            except Exception:
+                pass
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -988,6 +1028,8 @@ class StudioHandler(SimpleHTTPRequestHandler):
 
         if parsed.path == "/api/generate":
             task_id = str(int(time.time() * 1000))
+            raw_audio = data.get("audio_file")
+            clean_audio = Path(raw_audio).name if raw_audio else None
             task_item = {
                 "id": task_id,
                 "title": data.get("title", "").strip(),
@@ -998,12 +1040,12 @@ class StudioHandler(SimpleHTTPRequestHandler):
                 "seed": int(data.get("seed", 42)),
                 "fast_mode": bool(data.get("fast_mode", True)),
                 "is_instrumental": bool(data.get("is_instrumental", False)),
-                "audio_file": data.get("audio_file", None),
+                "audio_file": clean_audio,
                 "abc_score": data.get("abc_score", ""),
                 "midi_source": bool(data.get("midi_source", False)),
-                "vocal_lora": data.get("vocal_lora", None),
+                "vocal_lora": data.get("vocal_lora") or None,
                 "vocal_scale": float(data.get("vocal_scale", 0.8)),
-                "style_lora": data.get("style_lora", None),
+                "style_lora": data.get("style_lora") or None,
                 "style_scale": float(data.get("style_scale", 0.8))
             }
             task_queue.put(task_item)
