@@ -144,15 +144,18 @@ def get_pipeline():
         GLOBAL_PIPE.synthesize = safe_synth
     return GLOBAL_PIPE
 
+# =====================================================================
+# ИСПРАВЛЕННЫЙ БЛОК УПРАВЛЕНИЯ LoRA (AR + Multi-Adapter Support)
+# Обе LoRA (и вокал, и стиль) подключаются к AR-модели трансформера
+# =====================================================================
+
 LORA_STATE = {
     "ar_attr": None,
     "ar_original": None,
-    "nar_attr": None,
-    "nar_original": None,
+    "active_adapters": [],
 }
 
 _AR_CANDIDATES = ("model", "ar_model", "ar", "language_model", "ar_lm", "lm", "text_model")
-_NAR_CANDIDATES = ("nar", "nar_model", "nar_diffusion", "diffusion", "diffusion_model", "vae_model")
 
 def _find_pipe_module(pipe, candidates):
     for name in candidates:
@@ -165,11 +168,44 @@ def _find_pipe_module(pipe, candidates):
             return name, val
     return None, None
 
-def _scale_lora_adapter(peft_model, adapter_name, user_scale):
+def _prepare_lora_path(lora_path: Path, adapter_name: str) -> Path:
+    """Подготавливает директорию с правильным adapter_config.json для AR-модели."""
+    if lora_path.is_dir() and (lora_path / "adapter_config.json").exists():
+        return lora_path
+
+    target_dir = lora_path.parent / f"_peft_{lora_path.stem}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = target_dir / "adapter_config.json"
+
+    # Слои, на которых производилось дообучение в train_style_lora.py и train_vocal_lora.py
+    target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+    cfg_dict = {
+        "peft_type": "LORA",
+        "r": 16,
+        "lora_alpha": 32,
+        "target_modules": target_modules,
+        "lora_dropout": 0.05,
+        "bias": "none",
+        "task_type": "CAUSAL_LM"
+    }
+    cfg_path.write_text(json.dumps(cfg_dict, indent=2), encoding="utf-8")
+
+    weight_target = target_dir / f"adapter_model{lora_path.suffix}"
+    if not weight_target.exists() or weight_target.stat().st_size != lora_path.stat().st_size:
+        try:
+            shutil.copyfile(lora_path, weight_target)
+        except Exception:
+            pass
+    return target_dir
+
+def _scale_single_adapter(peft_model, adapter_name: str, user_scale: float):
+    """Корректная установка веса для конкретного адаптера."""
     try:
         user_scale = float(user_scale)
     except (TypeError, ValueError):
         return
+
     for module in peft_model.modules():
         if hasattr(module, "set_scale"):
             try:
@@ -188,109 +224,103 @@ def _scale_lora_adapter(peft_model, adapter_name, user_scale):
             base_ratio = float(alpha_val) / float(r_val) if r_val else 1.0
             scaling[adapter_name] = base_ratio * user_scale
 
-def _prepare_lora_path(lora_path: Path, adapter_name: str) -> Path:
-    if lora_path.is_dir():
-        return lora_path
-    target_dir = lora_path.parent / f"_peft_{lora_path.stem}"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = target_dir / "adapter_config.json"
-    if not cfg_path.exists():
-        is_nar = "nar" in adapter_name.lower() or "style" in adapter_name.lower()
-        target_modules = ["to_q", "to_k", "to_v", "to_out.0"] if is_nar else ["q_proj", "v_proj", "k_proj", "o_proj"]
-        cfg_dict = {
-            "peft_type": "LORA",
-            "r": 16,
-            "lora_alpha": 32,
-            "target_modules": target_modules,
-            "lora_dropout": 0.05,
-            "bias": "none",
-            "task_type": None if is_nar else "CAUSAL_LM"
-        }
-        cfg_path.write_text(json.dumps(cfg_dict, indent=2), encoding="utf-8")
-    weight_target = target_dir / f"adapter_model{lora_path.suffix}"
-    if not weight_target.exists() or weight_target.stat().st_size != lora_path.stat().st_size:
-        try:
-            shutil.copyfile(lora_path, weight_target)
-        except Exception:
-            pass
-    return target_dir
-
-def _attach_lora(module, lora_path: Path, adapter_name: str, scale: float):
-    if PeftModel is None:
-        raise RuntimeError("peft не установлен")
-    ready_path = _prepare_lora_path(lora_path, adapter_name)
-    if isinstance(module, PeftModel):
-        peft_config = getattr(module, "peft_config", {}) or {}
-        if adapter_name in peft_config:
-            try:
-                module.delete_adapter(adapter_name)
-            except Exception:
-                pass
-        module.load_adapter(str(ready_path), adapter_name=adapter_name)
-        module.set_adapter(adapter_name)
-        peft_model = module
-    else:
-        peft_model = PeftModel.from_pretrained(module, str(ready_path), adapter_name=adapter_name)
-        peft_model.set_adapter(adapter_name)
-    _scale_lora_adapter(peft_model, adapter_name, scale)
-    return peft_model
-
 def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
+    """Подключает вокальную и стилевую LoRA к авторегрессионной модели как мульти-адаптеры."""
     loaded = {"vocal": False, "style": False}
+    if PeftModel is None:
+        print("[LoRA Error] Библиотека peft не установлена!")
+        return loaded
+
+    ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
+    if ar_base is None:
+        print("[LoRA Error] Не удалось найти AR модель в пайплайне.")
+        return loaded
+
+    if LORA_STATE["ar_original"] is None:
+        LORA_STATE["ar_attr"] = ar_attr
+        LORA_STATE["ar_original"] = ar_base
+
+    current_module = getattr(pipe, ar_attr)
+    adapters_to_load = []
 
     if vocal_lora:
         try:
             v_path = safe_resolve(LORAS_DIR, vocal_lora)
             if v_path.exists():
-                ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
-                if ar_base is not None:
-                    peft_ar = _attach_lora(ar_base, v_path, "vocal_adapter", vocal_scale)
-                    setattr(pipe, ar_attr, peft_ar)
-                    LORA_STATE["ar_attr"] = ar_attr
-                    LORA_STATE["ar_original"] = ar_base
-                    loaded["vocal"] = True
+                adapters_to_load.append(("vocal_adapter", v_path, vocal_scale, "vocal"))
         except Exception as e:
-            print(f"[LoRA Error] Вокальная LoRA: {e}")
+            print(f"[LoRA Error] Путь вокальной LoRA: {e}")
 
     if style_lora:
         try:
             s_path = safe_resolve(LORAS_DIR, style_lora)
             if s_path.exists():
-                nar_attr, nar_base = _find_pipe_module(pipe, _NAR_CANDIDATES)
-                if nar_base is not None:
-                    peft_nar = _attach_lora(nar_base, s_path, "style_adapter", style_scale)
-                    setattr(pipe, nar_attr, peft_nar)
-                    LORA_STATE["nar_attr"] = nar_attr
-                    LORA_STATE["nar_original"] = nar_base
-                    loaded["style"] = True
+                adapters_to_load.append(("style_adapter", s_path, style_scale, "style"))
         except Exception as e:
-            print(f"[LoRA Error] Стилевая LoRA: {e}")
+            print(f"[LoRA Error] Путь стилевой LoRA: {e}")
+
+    if not adapters_to_load:
+        return loaded
+
+    try:
+        peft_model = current_module
+        first_name, first_path, first_scale, first_type = adapters_to_load[0]
+        ready_first_path = _prepare_lora_path(first_path, first_name)
+
+        if not isinstance(peft_model, PeftModel):
+            peft_model = PeftModel.from_pretrained(ar_base, str(ready_first_path), adapter_name=first_name)
+            setattr(pipe, ar_attr, peft_model)
+        else:
+            peft_model.load_adapter(str(ready_first_path), adapter_name=first_name)
+
+        _scale_single_adapter(peft_model, first_name, first_scale)
+        LORA_STATE["active_adapters"].append(first_name)
+        loaded[first_type] = True
+
+        if len(adapters_to_load) > 1:
+            second_name, second_path, second_scale, second_type = adapters_to_load[1]
+            ready_second_path = _prepare_lora_path(second_path, second_name)
+            peft_model.load_adapter(str(ready_second_path), adapter_name=second_name)
+            _scale_single_adapter(peft_model, second_name, second_scale)
+            LORA_STATE["active_adapters"].append(second_name)
+            loaded[second_type] = True
+
+            if hasattr(peft_model, "set_adapter"):
+                peft_model.set_adapter([first_name, second_name])
+        else:
+            if hasattr(peft_model, "set_adapter"):
+                peft_model.set_adapter(first_name)
+
+    except Exception as e:
+        print(f"[LoRA Error] Сбой подключения адаптеров: {e}")
 
     return loaded
 
 def remove_dual_loras(pipe):
-    for target in ("ar", "nar"):
-        attr = LORA_STATE.get(f"{target}_attr")
-        original = LORA_STATE.get(f"{target}_original")
-        if not attr or original is None:
-            continue
-        try:
-            current = getattr(pipe, attr, None)
-            if isinstance(current, PeftModel):
-                try:
-                    if hasattr(current, "disable_adapters"):
-                        current.disable_adapters()
-                    unloaded = current.unload()
-                    setattr(pipe, attr, unloaded)
-                except Exception:
-                    setattr(pipe, attr, original)
-            else:
+    """Снимает адаптеры и возвращает оригинальный чистый трансформер."""
+    attr = LORA_STATE.get("ar_attr")
+    original = LORA_STATE.get("ar_original")
+    if not attr or original is None:
+        return
+
+    try:
+        current = getattr(pipe, attr, None)
+        if isinstance(current, PeftModel):
+            try:
+                if hasattr(current, "disable_adapters"):
+                    current.disable_adapters()
+                unloaded = current.unload()
+                setattr(pipe, attr, unloaded)
+            except Exception:
                 setattr(pipe, attr, original)
-        except Exception:
+        else:
             setattr(pipe, attr, original)
-        finally:
-            LORA_STATE[f"{target}_attr"] = None
-            LORA_STATE[f"{target}_original"] = None
+    except Exception:
+        setattr(pipe, attr, original)
+    finally:
+        LORA_STATE["ar_attr"] = None
+        LORA_STATE["ar_original"] = None
+        LORA_STATE["active_adapters"] = []
 
 DEFAULT_PRESETS = [
     {
