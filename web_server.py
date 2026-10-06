@@ -125,7 +125,7 @@ GLOBAL_PIPE = None
 def get_pipeline():
     global GLOBAL_PIPE
     if GLOBAL_PIPE is None:
-        set_task_state(progress_msg=f"Загрузка весов YuE2-3B в память ({device.upper()})...")
+        set_task_state(progress_msg=f"Загрузка конфигурации YuE2-3B ({device.upper()})...")
         GLOBAL_PIPE = YuE2Pipeline.from_pretrained(
             "m-a-p/YuE2-3B",
             vae="m-a-p/YuE2-Vae",
@@ -145,31 +145,72 @@ def get_pipeline():
     return GLOBAL_PIPE
 
 # =====================================================================
-# ИСПРАВЛЕННЫЙ БЛОК УПРАВЛЕНИЯ LoRA (AR + Multi-Adapter Support)
-# Обе LoRA (и вокал, и стиль) подключаются к AR-модели трансформера
+# БЛОК УПРАВЛЕНИЯ LoRA (AR/MOT модель в YuE2)
 # =====================================================================
 
 LORA_STATE = {
+    "parent_obj": None,
     "ar_attr": None,
     "ar_original": None,
     "active_adapters": [],
 }
 
-_AR_CANDIDATES = ("model", "ar_model", "ar", "language_model", "ar_lm", "lm", "text_model")
+_AR_CANDIDATES = (
+    "mot", "model", "stage1", "stage1_model", "ar", "ar_model",
+    "language_model", "ar_lm", "lm", "text_model", "transformer",
+    "backbone", "ar_backbone", "_model", "_ar", "_mot"
+)
+
+def _ensure_pipe_models_loaded(pipe):
+    """
+    Гарантирует загрузку весов в память до внедрения LoRA хуков,
+    если YuE2 использует ленивую инициализацию.
+    """
+    for method_name in ("load_model", "_load_model", "load_models", "_load_models", "load_mot", "_load_mot"):
+        if hasattr(pipe, method_name) and callable(getattr(pipe, method_name)):
+            try:
+                getattr(pipe, method_name)()
+                break
+            except Exception:
+                pass
 
 def _find_pipe_module(pipe, candidates):
+    _ensure_pipe_models_loaded(pipe)
+
+    # 1. Поиск в прямых атрибутах pipe
     for name in candidates:
-        if not hasattr(pipe, name):
+        if hasattr(pipe, name):
+            val = getattr(pipe, name)
+            if val is not None and isinstance(val, torch.nn.Module):
+                return pipe, name, val
+
+    # 2. Поиск внутри подсловарей или контейнеров (например, pipe.models, pipe.modules)
+    for container_name in ("models", "modules", "components", "submodules"):
+        if hasattr(pipe, container_name):
+            container = getattr(pipe, container_name)
+            if isinstance(container, dict):
+                for name in candidates:
+                    if name in container and isinstance(container[name], torch.nn.Module):
+                        return container, name, container[name]
+
+    # 3. Глубокий поиск по всем атрибутам объекта pipe (пропускаем VAE и NAR)
+    for attr in dir(pipe):
+        if attr.startswith("__"):
             continue
-        val = getattr(pipe, name)
-        if val is None:
-            continue
-        if hasattr(val, "parameters"):
-            return name, val
-    return None, None
+        try:
+            val = getattr(pipe, attr)
+            if isinstance(val, torch.nn.Module) and hasattr(val, "named_modules"):
+                attr_lower = attr.lower()
+                if "vae" not in attr_lower and "nar" not in attr_lower:
+                    mod_names = [m[0] for m in val.named_modules()]
+                    if any("q_proj" in m or "layers" in m or "attn" in m for m in mod_names):
+                        return pipe, attr, val
+        except Exception:
+            pass
+
+    return None, None, None
 
 def _prepare_lora_path(lora_path: Path, adapter_name: str) -> Path:
-    """Подготавливает директорию с правильным adapter_config.json для AR-модели."""
     if lora_path.is_dir() and (lora_path / "adapter_config.json").exists():
         return lora_path
 
@@ -177,7 +218,6 @@ def _prepare_lora_path(lora_path: Path, adapter_name: str) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     cfg_path = target_dir / "adapter_config.json"
 
-    # Слои, на которых производилось дообучение в train_style_lora.py и train_vocal_lora.py
     target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
     cfg_dict = {
@@ -200,7 +240,6 @@ def _prepare_lora_path(lora_path: Path, adapter_name: str) -> Path:
     return target_dir
 
 def _scale_single_adapter(peft_model, adapter_name: str, user_scale: float):
-    """Корректная установка веса для конкретного адаптера."""
     try:
         user_scale = float(user_scale)
     except (TypeError, ValueError):
@@ -224,23 +263,36 @@ def _scale_single_adapter(peft_model, adapter_name: str, user_scale: float):
             base_ratio = float(alpha_val) / float(r_val) if r_val else 1.0
             scaling[adapter_name] = base_ratio * user_scale
 
+def _set_module_on_parent(parent, attr, module):
+    if isinstance(parent, dict):
+        parent[attr] = module
+    else:
+        setattr(parent, attr, module)
+
+def _get_module_from_parent(parent, attr):
+    if isinstance(parent, dict):
+        return parent.get(attr)
+    return getattr(parent, attr, None)
+
 def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
-    """Подключает вокальную и стилевую LoRA к авторегрессионной модели как мульти-адаптеры."""
     loaded = {"vocal": False, "style": False}
     if PeftModel is None:
         print("[LoRA Error] Библиотека peft не установлена!")
         return loaded
 
-    ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
+    parent_obj, ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
     if ar_base is None:
-        print("[LoRA Error] Не удалось найти AR модель в пайплайне.")
+        print("[LoRA Error] Не удалось найти AR/MOT модель в пайплайне. Атрибуты pipe:", [a for a in dir(pipe) if not a.startswith('_')])
         return loaded
 
+    print(f"[LoRA Info] Найдена модель для адаптации: {ar_attr} ({type(ar_base).__name__})")
+
     if LORA_STATE["ar_original"] is None:
+        LORA_STATE["parent_obj"] = parent_obj
         LORA_STATE["ar_attr"] = ar_attr
         LORA_STATE["ar_original"] = ar_base
 
-    current_module = getattr(pipe, ar_attr)
+    current_module = _get_module_from_parent(parent_obj, ar_attr)
     adapters_to_load = []
 
     if vocal_lora:
@@ -249,7 +301,7 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
             if v_path.exists():
                 adapters_to_load.append(("vocal_adapter", v_path, vocal_scale, "vocal"))
         except Exception as e:
-            print(f"[LoRA Error] Путь вокальной LoRA: {e}")
+            print(f"[LoRA Error] Ошибка пути вокальной LoRA: {e}")
 
     if style_lora:
         try:
@@ -257,7 +309,7 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
             if s_path.exists():
                 adapters_to_load.append(("style_adapter", s_path, style_scale, "style"))
         except Exception as e:
-            print(f"[LoRA Error] Путь стилевой LoRA: {e}")
+            print(f"[LoRA Error] Ошибка пути стилевой LoRA: {e}")
 
     if not adapters_to_load:
         return loaded
@@ -269,13 +321,14 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
 
         if not isinstance(peft_model, PeftModel):
             peft_model = PeftModel.from_pretrained(ar_base, str(ready_first_path), adapter_name=first_name)
-            setattr(pipe, ar_attr, peft_model)
+            _set_module_on_parent(parent_obj, ar_attr, peft_model)
         else:
             peft_model.load_adapter(str(ready_first_path), adapter_name=first_name)
 
         _scale_single_adapter(peft_model, first_name, first_scale)
         LORA_STATE["active_adapters"].append(first_name)
         loaded[first_type] = True
+        print(f"[LoRA Info] Успешно загружен адаптер '{first_name}' (скейл {first_scale})")
 
         if len(adapters_to_load) > 1:
             second_name, second_path, second_scale, second_type = adapters_to_load[1]
@@ -284,6 +337,7 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
             _scale_single_adapter(peft_model, second_name, second_scale)
             LORA_STATE["active_adapters"].append(second_name)
             loaded[second_type] = True
+            print(f"[LoRA Info] Успешно загружен адаптер '{second_name}' (скейл {second_scale})")
 
             if hasattr(peft_model, "set_adapter"):
                 peft_model.set_adapter([first_name, second_name])
@@ -297,27 +351,28 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
     return loaded
 
 def remove_dual_loras(pipe):
-    """Снимает адаптеры и возвращает оригинальный чистый трансформер."""
+    parent = LORA_STATE.get("parent_obj")
     attr = LORA_STATE.get("ar_attr")
     original = LORA_STATE.get("ar_original")
-    if not attr or original is None:
+    if not parent or not attr or original is None:
         return
 
     try:
-        current = getattr(pipe, attr, None)
+        current = _get_module_from_parent(parent, attr)
         if isinstance(current, PeftModel):
             try:
                 if hasattr(current, "disable_adapters"):
                     current.disable_adapters()
                 unloaded = current.unload()
-                setattr(pipe, attr, unloaded)
+                _set_module_on_parent(parent, attr, unloaded)
             except Exception:
-                setattr(pipe, attr, original)
+                _set_module_on_parent(parent, attr, original)
         else:
-            setattr(pipe, attr, original)
+            _set_module_on_parent(parent, attr, original)
     except Exception:
-        setattr(pipe, attr, original)
+        _set_module_on_parent(parent, attr, original)
     finally:
+        LORA_STATE["parent_obj"] = None
         LORA_STATE["ar_attr"] = None
         LORA_STATE["ar_original"] = None
         LORA_STATE["active_adapters"] = []
@@ -477,6 +532,9 @@ def generation_worker():
         try:
             pipe = get_pipeline()
 
+            # Инициализируем модель, если она еще в состоянии отложенной загрузки
+            _ensure_pipe_models_loaded(pipe)
+
             vocal_lora = task.get("vocal_lora")
             vocal_scale = float(task.get("vocal_scale", 0.8))
             style_lora = task.get("style_lora")
@@ -515,6 +573,7 @@ def generation_worker():
                 set_task_state(progress_msg=f"Символическое планирование (cot='{chosen_cot}')...")
                 gen_kwargs["cot"] = chosen_cot
 
+            # Запуск инференса
             song = pipe(**gen_kwargs)
 
             set_task_state(progress_msg="Сохранение аудио и нотных артефактов...")
