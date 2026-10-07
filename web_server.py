@@ -1,10 +1,14 @@
 import os
 import gc
+import sys
 import json
 import time
 import queue
 import shutil
+import inspect
 import threading
+import traceback
+import dataclasses
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -70,38 +74,236 @@ def safe_resolve(base_dir: Path, subpath: str) -> Path:
 def safe_track_id(tid: str) -> str:
     return "".join(c for c in str(tid) if c.isalnum() or c in ("_", "-"))
 
+CURRENT_TASK_IS_FAST = True
+
+# ---------------------------------------------------------------------
+# Прокси-обертка для NAR модели для гарантированной защиты от нехватки атрибутов
+# ---------------------------------------------------------------------
+class SafeNARModelWrapper:
+    """
+    Гарантирует, что обращение к wrapper.model вернет объект,
+    содержащий и embed_tokens, и rotary_emb, и layers.
+    """
+    def __init__(self, raw_model):
+        self._raw_model = raw_model
+        # Ищем настоящий backbone (где лежат embed_tokens и layers)
+        real_backbone = None
+        
+        # 1. Проверяем raw_model.model
+        if hasattr(raw_model, "model"):
+            cand = raw_model.model
+            if hasattr(cand, "embed_tokens"):
+                real_backbone = cand
+            elif hasattr(cand, "model") and hasattr(cand.model, "embed_tokens"):
+                real_backbone = cand.model
+
+        # 2. Если не найден, проверяем raw_model напрямую
+        if real_backbone is None:
+            if hasattr(raw_model, "embed_tokens"):
+                real_backbone = raw_model
+            elif hasattr(raw_model, "base_model") and hasattr(raw_model.base_model, "embed_tokens"):
+                real_backbone = raw_model.base_model
+
+        # 3. Дефолтный фоллбэк
+        if real_backbone is None:
+            real_backbone = getattr(raw_model, "model", raw_model)
+
+        # Проверяем наличие rotary_emb у найденного backbone
+        if not hasattr(real_backbone, "rotary_emb"):
+            rot_cand = None
+            if hasattr(raw_model, "rotary_emb"):
+                rot_cand = raw_model.rotary_emb
+            elif hasattr(raw_model, "model") and hasattr(raw_model.model, "rotary_emb"):
+                rot_cand = raw_model.model.rotary_emb
+            elif hasattr(real_backbone, "layers") and len(real_backbone.layers) > 0:
+                first_layer = real_backbone.layers[0]
+                if hasattr(first_layer, "self_attn") and hasattr(first_layer.self_attn, "rotary_emb"):
+                    rot_cand = first_layer.self_attn.rotary_emb
+
+            if rot_cand is not None:
+                try:
+                    setattr(real_backbone, "rotary_emb", rot_cand)
+                except Exception:
+                    pass
+
+        # Проверяем наличие embed_tokens
+        if not hasattr(real_backbone, "embed_tokens"):
+            emb_cand = None
+            if hasattr(raw_model, "get_input_embeddings"):
+                emb_cand = raw_model.get_input_embeddings()
+            elif hasattr(raw_model, "embed_tokens"):
+                emb_cand = raw_model.embed_tokens
+
+            if emb_cand is not None:
+                try:
+                    setattr(real_backbone, "embed_tokens", emb_cand)
+                except Exception:
+                    pass
+
+        self.model = real_backbone
+
+    def __getattr__(self, name):
+        return getattr(self._raw_model, name)
+
+    def __call__(self, *args, **kwargs):
+        return self._raw_model(*args, **kwargs)
+
+# ---------------------------------------------------------------------
+# Патч CachedNAR: чанкирование внимания (512 токенов) + применение SafeNARModelWrapper
+# ---------------------------------------------------------------------
 ORIG_CACHED_NAR_INIT = yue_nar.CachedNAR.__init__
 
-def patched_cached_nar_init(self, model, chunk, attention, query_chunk_size=None, *args, **kwargs):
-    return ORIG_CACHED_NAR_INIT(self, model, chunk, attention, query_chunk_size=512, *args, **kwargs)
+def patched_cached_nar_init(self, *args, **kwargs):
+    call_args = list(args)
+    call_kwargs = dict(kwargs)
+
+    # Нормализуем переданную модель через безопасную обертку
+    if len(call_args) > 0:
+        call_args[0] = SafeNARModelWrapper(call_args[0])
+    elif "model" in call_kwargs:
+        call_kwargs["model"] = SafeNARModelWrapper(call_kwargs["model"])
+
+    try:
+        sig = inspect.signature(ORIG_CACHED_NAR_INIT)
+        param_names = list(sig.parameters.keys())
+        if "query_chunk_size" in param_names:
+            pos = param_names.index("query_chunk_size")
+            arg_idx = pos - 1 if (param_names and param_names[0] == "self") else pos
+            if 0 <= arg_idx < len(call_args):
+                call_args[arg_idx] = 512
+            else:
+                call_kwargs["query_chunk_size"] = 512
+        else:
+            call_kwargs["query_chunk_size"] = 512
+    except Exception:
+        call_kwargs["query_chunk_size"] = 512
+
+    return ORIG_CACHED_NAR_INIT(self, *call_args, **call_kwargs)
 
 yue_nar.CachedNAR.__init__ = patched_cached_nar_init
 
-CURRENT_TASK_IS_FAST = True
-
+# ---------------------------------------------------------------------
+# Патч NAR Synthesize: безопасная очистка VRAM и шаги диффузии
+# ---------------------------------------------------------------------
 ORIGINAL_NAR_SYNTHESIZE = yue_nar.synthesize
+
 def safe_fast_synthesize(*args, **kwargs):
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    gc.collect()
+
+    call_args = list(args)
+    call_kwargs = dict(kwargs)
+
+    # Оборачиваем модель на входе в synthesize
+    if len(call_args) > 0:
+        call_args[0] = SafeNARModelWrapper(call_args[0])
+    elif "model" in call_kwargs:
+        call_kwargs["model"] = SafeNARModelWrapper(call_kwargs["model"])
+
     if CURRENT_TASK_IS_FAST:
-        if "steps" in kwargs:
-            kwargs["steps"] = 16
-        elif len(args) >= 6:
-            args_list = list(args)
-            args_list[5] = 16
-            args = tuple(args_list)
-    return ORIGINAL_NAR_SYNTHESIZE(*args, **kwargs)
+        modified = False
+        for k in ("steps", "num_steps", "n_steps", "diffusion_steps"):
+            if k in call_kwargs:
+                call_kwargs[k] = 16
+                modified = True
+                break
+
+        if not modified:
+            try:
+                sig = inspect.signature(ORIGINAL_NAR_SYNTHESIZE)
+                param_names = list(sig.parameters.keys())
+                for k in ("steps", "num_steps", "n_steps", "diffusion_steps"):
+                    if k in param_names:
+                        idx = param_names.index(k)
+                        if idx < len(call_args):
+                            call_args[idx] = 16
+                            modified = True
+                        else:
+                            call_kwargs[k] = 16
+                            modified = True
+                        break
+            except Exception:
+                pass
+
+        if not modified and len(call_args) >= 6 and isinstance(call_args[5], int):
+            call_args[5] = 16
+
+    return ORIGINAL_NAR_SYNTHESIZE(*call_args, **call_kwargs)
 
 yue_nar.synthesize = safe_fast_synthesize
 
+# ---------------------------------------------------------------------
+# Патч Sampling Generate: безопасная модификация frozen dataclass
+# ---------------------------------------------------------------------
 ORIGINAL_SAMPLING_GENERATE = yue_sampling.generate_tokens
-def safe_fast_generate_tokens(model, prefix, sampling, seed, phase, *args, **kwargs):
-    if CURRENT_TASK_IS_FAST and phase == "song":
-        if hasattr(sampling, "max_tokens"):
-            sampling.max_tokens = min(sampling.max_tokens, 3200)
-        elif hasattr(sampling, "max_length"):
-            sampling.max_length = min(sampling.max_length, 3200)
-    return ORIGINAL_SAMPLING_GENERATE(model, prefix, sampling, seed, phase, *args, **kwargs)
+
+def safe_fast_generate_tokens(model, prefix, sampling=None, seed=42, phase=None, *args, **kwargs):
+    call_kwargs = dict(kwargs)
+    effective_sampling = sampling
+
+    if CURRENT_TASK_IS_FAST and (phase == "song" or phase is None):
+        if effective_sampling is not None:
+            if dataclasses.is_dataclass(effective_sampling):
+                changes = {}
+                for field in dataclasses.fields(effective_sampling):
+                    if field.name in ("max_tokens", "max_new_tokens", "max_length", "target_tokens"):
+                        val = getattr(effective_sampling, field.name)
+                        if isinstance(val, (int, float)) and val > 0:
+                            changes[field.name] = min(int(val), 3200)
+                if changes:
+                    try:
+                        effective_sampling = dataclasses.replace(effective_sampling, **changes)
+                    except Exception:
+                        pass
+            elif isinstance(effective_sampling, dict):
+                effective_sampling = dict(effective_sampling)
+                for k in ("max_tokens", "max_new_tokens", "max_length", "target_tokens"):
+                    if k in effective_sampling and isinstance(effective_sampling[k], (int, float)) and effective_sampling[k] > 0:
+                        effective_sampling[k] = min(int(effective_sampling[k]), 3200)
+            else:
+                for attr in ("max_tokens", "max_new_tokens", "max_length", "target_tokens"):
+                    if hasattr(effective_sampling, attr):
+                        try:
+                            val = getattr(effective_sampling, attr)
+                            if isinstance(val, (int, float)) and val > 0:
+                                setattr(effective_sampling, attr, min(int(val), 3200))
+                        except Exception:
+                            pass
+
+        for k in ("max_tokens", "max_new_tokens", "max_length", "target_tokens"):
+            if k in call_kwargs and isinstance(call_kwargs[k], (int, float)) and call_kwargs[k] > 0:
+                call_kwargs[k] = min(int(call_kwargs[k]), 3200)
+
+    res = ORIGINAL_SAMPLING_GENERATE(model, prefix, effective_sampling, seed, phase, *args, **call_kwargs)
+
+    if CURRENT_TASK_IS_FAST and phase == "song" and res is not None:
+        if isinstance(res, torch.Tensor) and res.shape[-1] > 3200:
+            print(f"[FAST MODE] Обрезка токенов песни: {res.shape[-1]} -> 3200")
+            res = res[..., :3200]
+        elif isinstance(res, (list, tuple)) and len(res) > 3200:
+            print(f"[FAST MODE] Обрезка токенов песни: {len(res)} -> 3200")
+            res = res[:3200]
+
+    return res
 
 yue_sampling.generate_tokens = safe_fast_generate_tokens
+
+def patch_all_yue_modules():
+    for mod_name, mod in list(sys.modules.items()):
+        if mod and mod_name.startswith("yue2"):
+            if hasattr(mod, "generate_tokens") and getattr(mod, "generate_tokens") != safe_fast_generate_tokens:
+                setattr(mod, "generate_tokens", safe_fast_generate_tokens)
+            if hasattr(mod, "synthesize") and getattr(mod, "synthesize") != safe_fast_synthesize:
+                setattr(mod, "synthesize", safe_fast_synthesize)
+            if hasattr(mod, "CachedNAR"):
+                c_cls = getattr(mod, "CachedNAR")
+                if hasattr(c_cls, "__init__") and getattr(c_cls, "__init__") != patched_cached_nar_init:
+                    c_cls.__init__ = patched_cached_nar_init
+
+patch_all_yue_modules()
 
 task_queue = queue.Queue()
 task_lock = threading.Lock()
@@ -133,19 +335,11 @@ def get_pipeline():
             backend="torch-eager",
             cache_dir=str(MODELS_CACHE_DIR)
         )
-        orig_synth = GLOBAL_PIPE.synthesize
-        def safe_synth(*args, **kwargs):
-            if device == "cuda":
-                torch.cuda.empty_cache()
-            elif device == "mps":
-                torch.mps.empty_cache()
-            gc.collect()
-            return orig_synth(*args, **kwargs)
-        GLOBAL_PIPE.synthesize = safe_synth
+        patch_all_yue_modules()
     return GLOBAL_PIPE
 
 # =====================================================================
-# БЛОК УПРАВЛЕНИЯ LoRA (AR/MOT модель в YuE2)
+# БЛОК УПРАВЛЕНИЯ LoRA (Строго AR / MOT модель)
 # =====================================================================
 
 LORA_STATE = {
@@ -155,17 +349,12 @@ LORA_STATE = {
     "active_adapters": [],
 }
 
-_AR_CANDIDATES = (
-    "mot", "model", "stage1", "stage1_model", "ar", "ar_model",
-    "language_model", "ar_lm", "lm", "text_model", "transformer",
-    "backbone", "ar_backbone", "_model", "_ar", "_mot"
+_AR_STRICT_CANDIDATES = (
+    "mot", "stage1", "stage1_model", "ar", "ar_model",
+    "language_model", "ar_lm", "lm", "text_model"
 )
 
 def _ensure_pipe_models_loaded(pipe):
-    """
-    Гарантирует загрузку весов в память до внедрения LoRA хуков,
-    если YuE2 использует ленивую инициализацию.
-    """
     for method_name in ("load_model", "_load_model", "load_models", "_load_models", "load_mot", "_load_mot"):
         if hasattr(pipe, method_name) and callable(getattr(pipe, method_name)):
             try:
@@ -174,28 +363,28 @@ def _ensure_pipe_models_loaded(pipe):
             except Exception:
                 pass
 
-def _find_pipe_module(pipe, candidates):
+def _find_ar_module(pipe):
     _ensure_pipe_models_loaded(pipe)
 
-    # 1. Поиск в прямых атрибутах pipe
-    for name in candidates:
+    # 1. Поиск по прямым именам компонентов
+    for name in _AR_STRICT_CANDIDATES:
         if hasattr(pipe, name):
             val = getattr(pipe, name)
             if val is not None and isinstance(val, torch.nn.Module):
                 return pipe, name, val
 
-    # 2. Поиск внутри подсловарей или контейнеров (например, pipe.models, pipe.modules)
+    # 2. Поиск в словарях компонентов
     for container_name in ("models", "modules", "components", "submodules"):
         if hasattr(pipe, container_name):
             container = getattr(pipe, container_name)
             if isinstance(container, dict):
-                for name in candidates:
+                for name in _AR_STRICT_CANDIDATES:
                     if name in container and isinstance(container[name], torch.nn.Module):
                         return container, name, container[name]
 
-    # 3. Глубокий поиск по всем атрибутам объекта pipe (пропускаем VAE и NAR)
+    # 3. Эвристический поиск: любой трансформер, кроме VAE и NAR (pipe.model)
     for attr in dir(pipe):
-        if attr.startswith("__"):
+        if attr.startswith("__") or attr in ("vae", "model"):
             continue
         try:
             val = getattr(pipe, attr)
@@ -203,7 +392,7 @@ def _find_pipe_module(pipe, candidates):
                 attr_lower = attr.lower()
                 if "vae" not in attr_lower and "nar" not in attr_lower:
                     mod_names = [m[0] for m in val.named_modules()]
-                    if any("q_proj" in m or "layers" in m or "attn" in m for m in mod_names):
+                    if any("layers" in m and "self_attn" in m for m in mod_names):
                         return pipe, attr, val
         except Exception:
             pass
@@ -274,18 +463,62 @@ def _get_module_from_parent(parent, attr):
         return parent.get(attr)
     return getattr(parent, attr, None)
 
+def set_active_adapters(peft_model, adapter_names: list[str]):
+    if not adapter_names:
+        return
+
+    if len(adapter_names) == 1:
+        if hasattr(peft_model, "set_adapter"):
+            try:
+                peft_model.set_adapter(adapter_names[0])
+            except Exception as e:
+                print(f"[LoRA Warning] peft_model.set_adapter({adapter_names[0]}): {e}")
+        return
+
+    for module in peft_model.modules():
+        if module is peft_model:
+            continue
+        activated = False
+        if hasattr(module, "set_adapter"):
+            try:
+                module.set_adapter(adapter_names)
+                activated = True
+            except Exception:
+                pass
+        if not activated:
+            if hasattr(module, "_active_adapter"):
+                try:
+                    module._active_adapter = list(adapter_names)
+                    activated = True
+                except Exception:
+                    pass
+            elif hasattr(module, "active_adapter") and not isinstance(getattr(type(module), "active_adapter", None), property):
+                try:
+                    module.active_adapter = list(adapter_names)
+                    activated = True
+                except Exception:
+                    pass
+
+    try:
+        if hasattr(peft_model, "_active_adapter"):
+            peft_model._active_adapter = adapter_names[0]
+        elif hasattr(peft_model, "active_adapter") and not isinstance(getattr(type(peft_model), "active_adapter", None), property):
+            peft_model.active_adapter = adapter_names[0]
+    except Exception:
+        pass
+
 def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
     loaded = {"vocal": False, "style": False}
     if PeftModel is None:
         print("[LoRA Error] Библиотека peft не установлена!")
         return loaded
 
-    parent_obj, ar_attr, ar_base = _find_pipe_module(pipe, _AR_CANDIDATES)
+    parent_obj, ar_attr, ar_base = _find_ar_module(pipe)
     if ar_base is None:
-        print("[LoRA Error] Не удалось найти AR/MOT модель в пайплайне. Атрибуты pipe:", [a for a in dir(pipe) if not a.startswith('_')])
+        print("[LoRA Error] Не удалось найти AR/MOT модель в пайплайне.")
         return loaded
 
-    print(f"[LoRA Info] Найдена модель для адаптации: {ar_attr} ({type(ar_base).__name__})")
+    print(f"[LoRA Info] Найдена AR модель для адаптации: {ar_attr} ({type(ar_base).__name__})")
 
     if LORA_STATE["ar_original"] is None:
         LORA_STATE["parent_obj"] = parent_obj
@@ -339,11 +572,9 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
             loaded[second_type] = True
             print(f"[LoRA Info] Успешно загружен адаптер '{second_name}' (скейл {second_scale})")
 
-            if hasattr(peft_model, "set_adapter"):
-                peft_model.set_adapter([first_name, second_name])
-        else:
-            if hasattr(peft_model, "set_adapter"):
-                peft_model.set_adapter(first_name)
+        active_names = [a[0] for a in adapters_to_load]
+        set_active_adapters(peft_model, active_names)
+        print(f"[LoRA Info] Активные адаптеры подключены к AR пайплайну: {active_names}")
 
     except Exception as e:
         print(f"[LoRA Error] Сбой подключения адаптеров: {e}")
@@ -354,7 +585,8 @@ def remove_dual_loras(pipe):
     parent = LORA_STATE.get("parent_obj")
     attr = LORA_STATE.get("ar_attr")
     original = LORA_STATE.get("ar_original")
-    if not parent or not attr or original is None:
+    active = list(LORA_STATE.get("active_adapters", []))
+    if not parent or not attr:
         return
 
     try:
@@ -363,14 +595,32 @@ def remove_dual_loras(pipe):
             try:
                 if hasattr(current, "disable_adapters"):
                     current.disable_adapters()
-                unloaded = current.unload()
-                _set_module_on_parent(parent, attr, unloaded)
             except Exception:
+                pass
+            for a_name in active:
+                if hasattr(current, "delete_adapter"):
+                    try:
+                        current.delete_adapter(a_name)
+                    except Exception:
+                        pass
+            if hasattr(current, "unload"):
+                try:
+                    unloaded = current.unload()
+                    _set_module_on_parent(parent, attr, unloaded)
+                except Exception:
+                    if original is not None:
+                        _set_module_on_parent(parent, attr, original)
+            elif original is not None:
                 _set_module_on_parent(parent, attr, original)
-        else:
+        elif original is not None:
             _set_module_on_parent(parent, attr, original)
-    except Exception:
-        _set_module_on_parent(parent, attr, original)
+    except Exception as e:
+        print(f"[LoRA Warning] Ошибка при отключении адаптеров: {e}")
+        if original is not None:
+            try:
+                _set_module_on_parent(parent, attr, original)
+            except Exception:
+                pass
     finally:
         LORA_STATE["parent_obj"] = None
         LORA_STATE["ar_attr"] = None
@@ -531,9 +781,8 @@ def generation_worker():
 
         try:
             pipe = get_pipeline()
-
-            # Инициализируем модель, если она еще в состоянии отложенной загрузки
             _ensure_pipe_models_loaded(pipe)
+            patch_all_yue_modules()
 
             vocal_lora = task.get("vocal_lora")
             vocal_scale = float(task.get("vocal_scale", 0.8))
@@ -573,7 +822,10 @@ def generation_worker():
                 set_task_state(progress_msg=f"Символическое планирование (cot='{chosen_cot}')...")
                 gen_kwargs["cot"] = chosen_cot
 
-            # Запуск инференса
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
             song = pipe(**gen_kwargs)
 
             set_task_state(progress_msg="Сохранение аудио и нотных артефактов...")
@@ -650,9 +902,11 @@ def generation_worker():
             set_task_state(status="completed", progress_msg=f"Готово за {duration_sec} сек!")
 
         except Exception as e:
+            traceback.print_exc()
+            print(f"[Error in generation_worker] {e}")
             set_task_state(status="error", error=str(e), progress_msg=f"Ошибка: {str(e)}")
         finally:
-            if pipe and (loras_status["vocal"] or loras_status["style"]):
+            if pipe and LORA_STATE["parent_obj"] is not None:
                 remove_dual_loras(pipe)
             if device == "cuda":
                 torch.cuda.empty_cache()
@@ -836,28 +1090,6 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(list_available_loras()).encode("utf-8"))
-            return
-
-        if parsed.path == "/api/loras/debug":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.end_headers()
-            info = {"pipe_loaded": GLOBAL_PIPE is not None, "attributes": {}, "lora_state": {}}
-            if GLOBAL_PIPE is not None:
-                for name in dir(GLOBAL_PIPE):
-                    if name.startswith("_"):
-                        continue
-                    try:
-                        val = getattr(GLOBAL_PIPE, name)
-                        if hasattr(val, "parameters"):
-                            info["attributes"][name] = type(val).__name__
-                    except Exception:
-                        pass
-            info["lora_state"] = {
-                k: (type(v).__name__ if v is not None else None)
-                for k, v in LORA_STATE.items()
-            }
-            self.wfile.write(json.dumps(info, ensure_ascii=False).encode("utf-8"))
             return
 
         if parsed.path == "/api/status":
