@@ -22,6 +22,9 @@
 
 ---
 
+## Collab (Cloud version)
+[https://github.com/cristie-music/YuE2-3B-Studio](https://github.com/cristie-music/YuE2-3B-Studio)
+
 ## Архитектура и оптимизации для 16 GB VRAM
 
 В оригинальном репозитории генерация композиций длиной более 2 минут на картах с 16 GB VRAM вызывает ошибку `CUDA out of memory` (аллокация матрицы внимания 3.88 GiB на этапе диффузии). В проекте применены следующие решения:
