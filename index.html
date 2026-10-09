@@ -53,9 +53,13 @@
           </div>
 
           <nav class="space-y-1.5">
-            <button class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 bg-white/10 text-white text-sm font-medium transition-colors">
+            <button id="navBtnTrack" onclick="setStudioMode('song')" class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 bg-white/10 text-white text-sm font-medium transition-colors">
               <svg class="w-5 h-5 text-pink-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-width="2"/><circle cx="12" cy="12" r="2" stroke-width="2"/></svg>
               Создать трек
+            </button>
+            <button id="navBtnLoop" onclick="setStudioMode('loop')" class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 text-zinc-400 hover:text-white hover:bg-white/5 text-sm font-medium transition-colors">
+              <svg class="w-5 h-5 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+              Создать Loop
             </button>
             <button onclick="openPresetsModal()" class="w-full rounded-xl flex items-center gap-3 px-3 py-2.5 text-zinc-400 hover:text-white hover:bg-white/5 text-sm font-medium transition-colors">
               <svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
@@ -81,7 +85,7 @@
               <span>VRAM Limit</span><span>16 GB</span>
             </div>
             <div class="flex justify-between text-zinc-400">
-              <span>Chunk NAR</span><span class="text-pink-400">512 tokens</span>
+              <span id="backendModeBadgeTitle">Режим</span><span id="backendModeBadge" class="text-pink-400">YuE2-3B</span>
             </div>
           </div>
 
@@ -100,12 +104,12 @@
         <div class="p-4 pb-12 space-y-4">
           
           <div class="flex items-center justify-between">
-            <span class="text-xs font-bold text-zinc-400 uppercase tracking-wider">Панель управления</span>
-            <span class="text-[10px] bg-green-500/10 text-green-400 border border-green-500/20 px-2 py-0.5 rounded-full font-mono">READY</span>
+            <span id="panelModeTitle" class="text-xs font-bold text-zinc-400 uppercase tracking-wider">Панель управления треком</span>
+            <span id="panelStatusBadge" class="text-[10px] bg-green-500/10 text-green-400 border border-green-500/20 px-2 py-0.5 rounded-full font-mono">READY</span>
           </div>
 
-          <!-- Выбор Persona -->
-          <div class="bg-suno-card rounded-xl border border-white/5 p-2.5 flex items-center justify-between">
+          <!-- Специфика Song: Persona -->
+          <div id="boxPersonaSection" class="bg-suno-card rounded-xl border border-white/5 p-2.5 flex items-center justify-between">
             <div class="flex items-center gap-2">
               <span class="w-2 h-2 rounded-full bg-blue-400"></span>
               <span class="text-xs font-bold text-zinc-400 uppercase">Persona:</span>
@@ -115,8 +119,8 @@
             </select>
           </div>
 
-          <!-- Выбор LoRA Адаптеров (Вокал + Стиль) -->
-          <div class="bg-suno-card rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 space-y-3">
+          <!-- Специфика Song: LoRA Адаптеры -->
+          <div id="boxLoraSection" class="bg-suno-card rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 space-y-3">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-amber-400"></span>
@@ -125,7 +129,6 @@
               <button onclick="loadLorasList()" class="text-[10px] text-zinc-400 hover:text-white" title="Обновить список">↻ Обновить</button>
             </div>
             
-            <!-- Вокальная LoRA -->
             <div class="space-y-1.5">
               <div class="flex items-center justify-between text-[11px]">
                 <span class="text-zinc-400">🎤 Вокальная LoRA (AR):</span>
@@ -139,7 +142,6 @@
               </div>
             </div>
 
-            <!-- Стилевая LoRA -->
             <div class="space-y-1.5 pt-1 border-t border-white/5">
               <div class="flex items-center justify-between text-[11px]">
                 <span class="text-zinc-400">🎸 Стилевая LoRA (NAR):</span>
@@ -154,14 +156,14 @@
             </div>
           </div>
 
-          <!-- Название трека -->
+          <!-- Название -->
           <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
-            <div class="px-3 py-2 text-[11px] font-bold text-zinc-400 border-b border-white/5 uppercase">Название трека</div>
+            <div id="titleInputHeader" class="px-3 py-2 text-[11px] font-bold text-zinc-400 border-b border-white/5 uppercase">Название трека</div>
             <input id="inputTitle" type="text" placeholder="Введите название..." class="w-full bg-transparent px-3 py-2.5 text-sm outline-none placeholder-zinc-600">
           </div>
 
-          <!-- Блок MIDI импорта -->
-          <div class="bg-suno-card rounded-xl border border-purple-500/20 bg-purple-500/5 overflow-hidden">
+          <!-- Специфика Song: MIDI импорт -->
+          <div id="boxMidiSection" class="bg-suno-card rounded-xl border border-purple-500/20 bg-purple-500/5 overflow-hidden">
             <div class="px-3 py-2 border-b border-purple-500/20 bg-purple-500/10 flex items-center justify-between">
               <span class="text-[11px] font-bold text-purple-300 uppercase tracking-wide flex items-center gap-1.5">
                 <span>♫</span> Создать трек из MIDI
@@ -176,8 +178,8 @@
             </div>
           </div>
 
-          <!-- Референс кавера -->
-          <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
+          <!-- Специфика Song: Кавер референс -->
+          <div id="boxCoverSection" class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
             <div class="px-3 py-2 border-b border-white/5 bg-white/[0.02] flex items-center justify-between">
               <span class="text-[11px] font-bold text-zinc-400 uppercase tracking-wide">Кавер / Референс аудио</span>
               <input type="file" id="coverFileInput" accept="audio/*" class="hidden" onchange="handleAudioUpload(event)">
@@ -190,11 +192,11 @@
             </div>
           </div>
 
-          <!-- Стиль музыки + Пресеты -->
+          <!-- Стиль / Промпт -->
           <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden relative">
             <div class="px-3 py-2 text-[11px] font-bold text-zinc-400 border-b border-white/5 uppercase flex justify-between items-center">
-              <span>Стиль музыки</span>
-              <div class="flex items-center gap-2">
+              <span id="styleFieldTitle">Стиль музыки</span>
+              <div id="presetsControlGroup" class="flex items-center gap-2">
                 <button onclick="openCreatePresetModal()" class="text-[10px] text-zinc-400 hover:text-white transition-colors" title="Сохранить как пресет">+ Пресет</button>
                 <div class="relative">
                   <button onclick="togglePresetDropdown()" class="text-[10px] text-pink-400 hover:underline flex items-center gap-1">
@@ -210,8 +212,8 @@
             <textarea id="inputStyle" rows="3" class="w-full bg-transparent p-3 text-xs outline-none resize-none placeholder-zinc-600" placeholder="e.g. industrial metal, EDM, female vocal, progressive metal, 135 bpm"></textarea>
           </div>
 
-          <!-- Текст песни / Инструментал -->
-          <div class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
+          <!-- Специфика Song: Текст песни -->
+          <div id="boxLyricsSection" class="bg-suno-card rounded-xl border border-white/5 overflow-hidden">
             <div class="flex items-center justify-between px-3 py-2.5 border-b border-white/5 bg-white/[0.02]">
               <span class="text-[11px] font-bold text-zinc-400 uppercase">Текст песни</span>
               <label class="flex items-center gap-2 cursor-pointer">
@@ -222,11 +224,12 @@
             <textarea id="inputLyrics" rows="7" class="w-full bg-transparent p-3 text-xs font-mono outline-none resize-none placeholder-zinc-600" placeholder="[verse]&#10;Words go here...&#10;&#10;[chorus]&#10;Chorus line..."></textarea>
           </div>
 
-          <!-- Параметры инференса -->
+          <!-- Параметры инференса (Адаптируются под Song или Loop) -->
           <div class="bg-suno-card rounded-xl border border-white/5 p-3 space-y-3">
             <div class="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">Параметры инференса</div>
             
-            <div class="space-y-1">
+            <!-- CoT (Только Song) -->
+            <div id="paramCotBlock" class="space-y-1">
               <span class="text-xs text-zinc-400">Режим планирования (CoT):</span>
               <select id="selectCot" onchange="updateCotHint()" class="w-full bg-black/40 border border-white/10 rounded-lg p-2 text-xs outline-none text-white">
                 <option value="melody">cot="melody" (Каверы, фиксация мелодии)</option>
@@ -238,21 +241,42 @@
               </p>
             </div>
 
-            <div class="space-y-1">
+            <!-- Длина лупа (Только Loop) -->
+            <div id="paramLoopDurationBlock" class="hidden space-y-1">
               <div class="flex justify-between text-xs">
-                <span class="text-zinc-400">CFG Scale:</span>
-                <span id="cfgVal" class="font-mono text-pink-400">1.2</span>
+                <span class="text-zinc-400">Длина лупа:</span>
+                <span id="loopDurationVal" class="font-mono text-emerald-400">8 сек</span>
               </div>
-              <input id="rangeCfg" type="range" min="1.0" max="2.5" step="0.1" value="1.2" oninput="document.getElementById('cfgVal').innerText = this.value" class="w-full accent-pink-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer">
+              <input id="rangeLoopDuration" type="range" min="2" max="20" step="1" value="8" oninput="document.getElementById('loopDurationVal').innerText = this.value + ' сек'" class="w-full accent-emerald-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer">
             </div>
 
+            <!-- Steps (Только Loop) -->
+            <div id="paramLoopStepsBlock" class="hidden space-y-1">
+              <div class="flex justify-between text-xs">
+                <span class="text-zinc-400">Шаги диффузии (Steps):</span>
+                <span id="loopStepsVal" class="font-mono text-emerald-400">30</span>
+              </div>
+              <input id="rangeLoopSteps" type="range" min="15" max="60" step="1" value="30" oninput="document.getElementById('loopStepsVal').innerText = this.value" class="w-full accent-emerald-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer">
+            </div>
+
+            <!-- CFG / Guidance Scale -->
+            <div class="space-y-1">
+              <div class="flex justify-between text-xs">
+                <span id="cfgLabelText" class="text-zinc-400">CFG Scale:</span>
+                <span id="cfgVal" class="font-mono text-pink-400">1.2</span>
+              </div>
+              <input id="rangeCfg" type="range" min="1.0" max="15.0" step="0.1" value="1.2" oninput="document.getElementById('cfgVal').innerText = this.value" class="w-full accent-pink-500 h-1.5 bg-zinc-800 rounded-lg cursor-pointer">
+            </div>
+
+            <!-- Seed -->
             <div class="flex items-center justify-between gap-2 pt-1">
               <span class="text-xs text-zinc-400">Seed:</span>
               <input id="inputSeed" type="number" value="42" class="w-24 bg-black/40 border border-white/10 rounded-lg px-2 py-1 text-xs font-mono text-right outline-none">
               <button onclick="document.getElementById('inputSeed').value = Math.floor(Math.random()*999999)" class="text-xs bg-white/5 hover:bg-white/10 px-2 py-1 rounded border border-white/5">🎲</button>
             </div>
 
-            <div class="pt-2 border-t border-white/5 flex items-center justify-between">
+            <!-- Fast Mode (Только Song) -->
+            <div id="paramFastModeBlock" class="pt-2 border-t border-white/5 flex items-center justify-between">
               <div>
                 <div class="text-xs font-semibold text-white">Режим FAST (16 шагов)</div>
                 <div class="text-[10px] text-zinc-500">Генерация ~3-4 мин вместо 14 мин</div>
@@ -264,7 +288,7 @@
           <!-- Кнопка генерации -->
           <button id="btnCreate" onclick="startGeneration()" class="w-full h-12 rounded-xl font-bold text-sm bg-gradient-to-r from-orange-500 to-pink-600 hover:brightness-110 active:scale-[0.98] transition-all flex items-center justify-center gap-2 shadow-lg">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
-            Создать трек
+            <span id="btnCreateText">Создать трек</span>
           </button>
 
           <!-- Прогресс -->
@@ -287,14 +311,14 @@
             <div class="flex items-center justify-between">
               <div>
                 <h1 class="text-xl font-bold">История генераций</h1>
-                <p class="text-xs text-zinc-500">Созданные треки в качестве 48kHz со всеми параметрами инференса</p>
+                <p class="text-xs text-zinc-500">Созданные треки и сэмпл-лупы с параметрами синтеза</p>
               </div>
               <button onclick="loadHistoryList()" class="text-xs bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded-lg border border-white/5 transition-colors">Обновить</button>
             </div>
 
             <!-- Поиск -->
             <div class="relative">
-              <input id="searchInput" oninput="filterHistory()" type="text" placeholder="Поиск по названию или стилю трека..." class="w-full bg-[#121214] border border-white/10 rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-zinc-500 outline-none focus:border-pink-500 transition-colors">
+              <input id="searchInput" oninput="filterHistory()" type="text" placeholder="Поиск по названию или стилю трека/лупа..." class="w-full bg-[#121214] border border-white/10 rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-zinc-500 outline-none focus:border-pink-500 transition-colors">
               <svg class="w-4 h-4 text-zinc-500 absolute left-3 top-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
             </div>
           </div>
@@ -499,6 +523,7 @@
   </div>
 
   <script>
+    let currentMode = "song"; // "song" или "loop"
     let rawHistoryData = [];
     let rawPresetsData = [];
     let rawPersonasData = [];
@@ -519,9 +544,73 @@
       document.getElementById("cotHint").innerHTML = cotDescriptions[val] || "";
     }
 
-    // -------------------------------------------------------------
-    // LoRA Адаптеры (Вокал + Стиль)
-    // -------------------------------------------------------------
+    // Переключение режимов интерфейса: Song (YuE2) <-> Loop (Stable Audio)
+    function setStudioMode(mode) {
+      currentMode = mode;
+      const isLoop = mode === "loop";
+
+      const navSong = document.getElementById("navBtnTrack");
+      const navLoop = document.getElementById("navBtnLoop");
+
+      if (isLoop) {
+        navLoop.className = "w-full rounded-xl flex items-center gap-3 px-3 py-2.5 bg-white/10 text-white text-sm font-medium transition-colors";
+        navSong.className = "w-full rounded-xl flex items-center gap-3 px-3 py-2.5 text-zinc-400 hover:text-white hover:bg-white/5 text-sm font-medium transition-colors";
+        
+        document.getElementById("panelModeTitle").innerText = "Создание Loop (Stable Audio)";
+        document.getElementById("backendModeBadge").innerText = "Stable Audio";
+        document.getElementById("backendModeBadge").className = "text-emerald-400";
+        document.getElementById("titleInputHeader").innerText = "Название Лупа";
+        document.getElementById("inputTitle").placeholder = "Например: Heavy Bass Synth Loop 120 bpm...";
+        document.getElementById("styleFieldTitle").innerText = "Описание лупа / инструментов";
+        document.getElementById("inputStyle").placeholder = "e.g. acoustic drum breakbeat, groovy, punchy kick, 120 bpm, analog tape, stereo";
+        document.getElementById("btnCreateText").innerText = "Сгенерировать Loop";
+
+        // Скрываем элементы, не нужные для лупов
+        document.getElementById("boxPersonaSection").classList.add("hidden");
+        document.getElementById("boxLoraSection").classList.add("hidden");
+        document.getElementById("boxMidiSection").classList.add("hidden");
+        document.getElementById("boxCoverSection").classList.add("hidden");
+        document.getElementById("boxLyricsSection").classList.add("hidden");
+        document.getElementById("paramCotBlock").classList.add("hidden");
+        document.getElementById("paramFastModeBlock").classList.add("hidden");
+
+        // Показываем параметры Stable Audio
+        document.getElementById("paramLoopDurationBlock").classList.remove("hidden");
+        document.getElementById("paramLoopStepsBlock").classList.remove("hidden");
+        document.getElementById("cfgLabelText").innerText = "Guidance Scale:";
+        document.getElementById("rangeCfg").value = 7.0;
+        document.getElementById("cfgVal").innerText = "7.0";
+      } else {
+        navSong.className = "w-full rounded-xl flex items-center gap-3 px-3 py-2.5 bg-white/10 text-white text-sm font-medium transition-colors";
+        navLoop.className = "w-full rounded-xl flex items-center gap-3 px-3 py-2.5 text-zinc-400 hover:text-white hover:bg-white/5 text-sm font-medium transition-colors";
+        
+        document.getElementById("panelModeTitle").innerText = "Панель управления треком";
+        document.getElementById("backendModeBadge").innerText = "YuE2-3B";
+        document.getElementById("backendModeBadge").className = "text-pink-400";
+        document.getElementById("titleInputHeader").innerText = "Название трека";
+        document.getElementById("inputTitle").placeholder = "Введите название...";
+        document.getElementById("styleFieldTitle").innerText = "Стиль музыки";
+        document.getElementById("inputStyle").placeholder = "e.g. industrial metal, EDM, female vocal, progressive metal, 135 bpm";
+        document.getElementById("btnCreateText").innerText = "Создать трек";
+
+        // Возвращаем полнофункциональный интерфейс YuE2
+        document.getElementById("boxPersonaSection").classList.remove("hidden");
+        document.getElementById("boxLoraSection").classList.remove("hidden");
+        document.getElementById("boxMidiSection").classList.remove("hidden");
+        document.getElementById("boxCoverSection").classList.remove("hidden");
+        document.getElementById("boxLyricsSection").classList.remove("hidden");
+        document.getElementById("paramCotBlock").classList.remove("hidden");
+        document.getElementById("paramFastModeBlock").classList.remove("hidden");
+
+        document.getElementById("paramLoopDurationBlock").classList.add("hidden");
+        document.getElementById("paramLoopStepsBlock").classList.add("hidden");
+        document.getElementById("cfgLabelText").innerText = "CFG Scale:";
+        document.getElementById("rangeCfg").value = 1.2;
+        document.getElementById("cfgVal").innerText = "1.2";
+      }
+    }
+
+    // LoRA Адаптеры
     async function loadLorasList() {
       try {
         const res = await fetch("/api/loras");
@@ -647,7 +736,7 @@
     }
 
     async function deleteTrack(trackId, title) {
-      const confirmed = confirm(`Вы уверены, что хотите безвозвратно удалить трек "${title}"?\nВсе аудиофайлы и нотные партитуры будут удалены с диска.`);
+      const confirmed = confirm(`Вы уверены, что хотите безвозвратно удалить трек/луп "${title}"?\nВсе аудиофайлы будут удалены с диска.`);
       if (!confirmed) return;
 
       try {
@@ -719,6 +808,7 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          mode: "song",
           title,
           style,
           lyrics: "",
@@ -1155,7 +1245,7 @@
     function renderHistoryItems(list) {
       const container = document.getElementById("historyList");
       if (list.length === 0) {
-        container.innerHTML = '<div class="text-xs text-zinc-600 text-center py-10">Треки не найдены.</div>';
+        container.innerHTML = '<div class="text-xs text-zinc-600 text-center py-10">Треки и лупы не найдены.</div>';
         return;
       }
 
@@ -1163,11 +1253,12 @@
         const isPlaying = currentPlayingId === item.id && !globalAudio.paused;
         const isLiked = item.rating === 1;
         const isDisliked = item.rating === -1;
+        const isLoop = !!item.is_loop;
 
         return `
           <div class="bg-suno-card rounded-xl border border-white/5 p-3 hover:border-white/10 transition-all flex items-start gap-3">
             
-            <div class="relative w-14 h-14 rounded-lg bg-gradient-to-br from-pink-500 to-purple-600 flex-shrink-0 flex items-center justify-center cursor-pointer shadow-md overflow-hidden" onclick='playTrack("${item.id}", "${item.url}", "${item.title.replace(/"/g, '&quot;')}", "${item.style.replace(/"/g, '&quot;')}")'>
+            <div class="relative w-14 h-14 rounded-lg bg-gradient-to-br ${isLoop ? 'from-emerald-500 to-teal-700' : 'from-pink-500 to-purple-600'} flex-shrink-0 flex items-center justify-center cursor-pointer shadow-md overflow-hidden" onclick='playTrack("${item.id}", "${item.url}", "${item.title.replace(/"/g, '&quot;')}", "${item.style.replace(/"/g, '&quot;')}")'>
               <div class="absolute inset-0 bg-black/25"></div>
               
               <button class="relative z-10 w-8 h-8 rounded-full bg-white text-black flex items-center justify-center shadow-lg hover:scale-110 active:scale-95 transition-transform">
@@ -1182,8 +1273,11 @@
               <div class="flex items-center justify-between gap-2">
                 <div class="flex items-center gap-2 truncate">
                   <h3 class="font-bold text-sm text-white truncate cursor-pointer hover:underline" onclick='playTrack("${item.id}", "${item.url}", "${item.title.replace(/"/g, '&quot;')}", "${item.style.replace(/"/g, '&quot;')}")'>${item.title}</h3>
-                  <span class="text-[9px] bg-pink-500/20 text-pink-400 px-1.5 py-0.5 rounded font-mono">${item.fast_mode ? 'FAST' : 'HQ'}</span>
-                  ${item.is_instrumental ? '<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">INST</span>' : ''}
+                  ${isLoop 
+                    ? `<span class="text-[9px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded font-mono font-bold">LOOP (${item.loop_duration || '8s'})</span>`
+                    : `<span class="text-[9px] bg-pink-500/20 text-pink-400 px-1.5 py-0.5 rounded font-mono">${item.fast_mode ? 'FAST' : 'HQ'}</span>`
+                  }
+                  ${item.is_instrumental && !isLoop ? '<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">INST</span>' : ''}
                   ${item.reference_audio ? '<span class="text-[9px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded font-mono">COVER</span>' : ''}
                   ${item.is_midi_gen ? '<span class="text-[9px] bg-purple-500/20 text-purple-300 px-1.5 py-0.5 rounded font-mono">FROM MIDI</span>' : ''}
                   ${item.vocal_lora ? `<span class="text-[9px] bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded font-mono">VOCAL LORA</span>` : ''}
@@ -1195,8 +1289,8 @@
               <p class="text-xs text-zinc-400 line-clamp-1">${item.style}</p>
 
               <div class="flex flex-wrap gap-2 text-[10px] font-mono text-zinc-500 pt-0.5">
-                <span>cot: <b class="text-zinc-300">${item.cot}</b></span>
-                <span>cfg: <b class="text-zinc-300">${item.cfg_scale}</b></span>
+                ${!isLoop ? `<span>cot: <b class="text-zinc-300">${item.cot}</b></span>` : ''}
+                <span>${isLoop ? 'guidance' : 'cfg'}: <b class="text-zinc-300">${item.cfg_scale}</b></span>
                 <span>seed: <b class="text-zinc-300">${item.seed}</b></span>
                 ${item.vocal_lora ? `<span>v-lora: <b class="text-amber-400">${item.vocal_lora} (${item.vocal_scale})</b></span>` : ''}
                 ${item.style_lora ? `<span>s-lora: <b class="text-purple-400">${item.style_lora} (${item.style_scale})</b></span>` : ''}
@@ -1214,17 +1308,19 @@
                 </div>
 
                 <div class="flex items-center gap-1.5 flex-wrap">
-                  <button onclick="openAbcEditor('${item.id}')" class="px-2 py-1 rounded-md text-xs bg-pink-500/15 hover:bg-pink-500/25 text-pink-300 transition-colors flex items-center gap-1" title="Редактировать партитуру">
-                    <span>✎</span> Edit
-                  </button>
-                  
-                  <button onclick="openCreatePersonaFromTrack('${item.id}')" class="px-2 py-1 rounded-md text-xs bg-blue-500/15 hover:bg-blue-500/25 text-blue-300 transition-colors flex items-center gap-1" title="Сохранить как Persona">
-                    <span>✦</span> Persona
-                  </button>
+                  ${!isLoop ? `
+                    <button onclick="openAbcEditor('${item.id}')" class="px-2 py-1 rounded-md text-xs bg-pink-500/15 hover:bg-pink-500/25 text-pink-300 transition-colors flex items-center gap-1" title="Редактировать партитуру">
+                      <span>✎</span> Edit
+                    </button>
+                    
+                    <button onclick="openCreatePersonaFromTrack('${item.id}')" class="px-2 py-1 rounded-md text-xs bg-blue-500/15 hover:bg-blue-500/25 text-blue-300 transition-colors flex items-center gap-1" title="Сохранить как Persona">
+                      <span>✦</span> Persona
+                    </button>
 
-                  <a href="/api/midi?id=${item.id}" download="track_${item.id}.mid" class="px-2 py-1 rounded-md text-xs bg-purple-500/15 hover:bg-purple-500/25 text-purple-300 transition-colors flex items-center gap-1" title="Экспорт в MIDI">
-                    <span>♫</span> MIDI
-                  </a>
+                    <a href="/api/midi?id=${item.id}" download="track_${item.id}.mid" class="px-2 py-1 rounded-md text-xs bg-purple-500/15 hover:bg-purple-500/25 text-purple-300 transition-colors flex items-center gap-1" title="Экспорт в MIDI">
+                      <span>♫</span> MIDI
+                    </a>
+                  ` : ''}
 
                   <button onclick="extractStems('${encodeURIComponent(window.location.origin + item.url)}')" class="px-2 py-1 rounded-md text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 transition-colors flex items-center gap-1" title="Разделить на 4 стэма в Demucs">
                     <span>✂</span> Stems
@@ -1234,11 +1330,11 @@
                     <span>↻</span> Повторить
                   </button>
 
-                  <a href="${item.url}" download="${item.filename}" class="px-2.5 py-1 rounded-md text-xs bg-pink-600 hover:bg-pink-500 text-white font-medium transition-colors flex items-center gap-1">
+                  <a href="${item.url}" download="${item.filename}" class="px-2.5 py-1 rounded-md text-xs ${isLoop ? 'bg-emerald-600 hover:bg-emerald-500' : 'bg-pink-600 hover:bg-pink-500'} text-white font-medium transition-colors flex items-center gap-1">
                     <span>↓</span> FLAC
                   </a>
 
-                  <button onclick="deleteTrack('${item.id}', '${item.title.replace(/'/g, "\\'")}')" class="p-1 rounded-md text-zinc-500 hover:text-red-400 hover:bg-red-500/10 transition-colors" title="Удалить трек">
+                  <button onclick="deleteTrack('${item.id}', '${item.title.replace(/'/g, "\\'")}')" class="p-1 rounded-md text-zinc-500 hover:text-red-400 hover:bg-red-500/10 transition-colors" title="Удалить">
                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
                   </button>
                 </div>
@@ -1250,50 +1346,54 @@
     }
 
     function recreateTrack(item) {
-      document.getElementById("inputTitle").value = item.title || "";
-      document.getElementById("inputStyle").value = item.style || "";
-      document.getElementById("inputLyrics").value = item.lyrics || "";
-      document.getElementById("selectCot").value = item.cot || "melody";
-      document.getElementById("rangeCfg").value = item.cfg_scale || 1.2;
-      document.getElementById("cfgVal").innerText = item.cfg_scale || 1.2;
-      document.getElementById("inputSeed").value = item.seed || 42;
-      document.getElementById("checkFast").checked = item.fast_mode !== false;
-      document.getElementById("checkInstrumental").checked = !!item.is_instrumental;
+      if (item.is_loop) {
+        setStudioMode("loop");
+        document.getElementById("inputTitle").value = item.title || "";
+        document.getElementById("inputStyle").value = item.style || "";
+        document.getElementById("rangeCfg").value = item.cfg_scale || 7.0;
+        document.getElementById("cfgVal").innerText = item.cfg_scale || 7.0;
+        document.getElementById("inputSeed").value = item.seed || 42;
+        if (item.loop_duration) {
+          const secs = parseInt(item.loop_duration) || 8;
+          document.getElementById("rangeLoopDuration").value = secs;
+          document.getElementById("loopDurationVal").innerText = secs + " сек";
+        }
+      } else {
+        setStudioMode("song");
+        document.getElementById("inputTitle").value = item.title || "";
+        document.getElementById("inputStyle").value = item.style || "";
+        document.getElementById("inputLyrics").value = item.lyrics || "";
+        document.getElementById("selectCot").value = item.cot || "melody";
+        document.getElementById("rangeCfg").value = item.cfg_scale || 1.2;
+        document.getElementById("cfgVal").innerText = item.cfg_scale || 1.2;
+        document.getElementById("inputSeed").value = item.seed || 42;
+        document.getElementById("checkFast").checked = item.fast_mode !== false;
+        document.getElementById("checkInstrumental").checked = !!item.is_instrumental;
 
-      document.getElementById("selectVocalLora").value = item.vocal_lora || "";
-      if (item.vocal_scale) {
-        document.getElementById("rangeVocalScale").value = item.vocal_scale;
-        document.getElementById("vocalScaleVal").innerText = item.vocal_scale;
+        document.getElementById("selectVocalLora").value = item.vocal_lora || "";
+        if (item.vocal_scale) {
+          document.getElementById("rangeVocalScale").value = item.vocal_scale;
+          document.getElementById("vocalScaleVal").innerText = item.vocal_scale;
+        }
+        document.getElementById("selectStyleLora").value = item.style_lora || "";
+        if (item.style_scale) {
+          document.getElementById("rangeStyleScale").value = item.style_scale;
+          document.getElementById("styleScaleVal").innerText = item.style_scale;
+        }
+        updateLoraInputs();
+        toggleInstrumental();
+        updateCotHint();
       }
-      document.getElementById("selectStyleLora").value = item.style_lora || "";
-      if (item.style_scale) {
-        document.getElementById("rangeStyleScale").value = item.style_scale;
-        document.getElementById("styleScaleVal").innerText = item.style_scale;
-      }
-      updateLoraInputs();
-
-      toggleInstrumental();
-      updateCotHint();
       window.scrollTo({top: 0, behavior: 'smooth'});
     }
 
     async function startGeneration() {
       const title = document.getElementById("inputTitle").value;
       const style = document.getElementById("inputStyle").value;
-      const lyrics = document.getElementById("inputLyrics").value;
-      const cot = document.getElementById("selectCot").value;
-      const cfg_scale = parseFloat(document.getElementById("rangeCfg").value);
       const seed = parseInt(document.getElementById("inputSeed").value);
-      const fast_mode = document.getElementById("checkFast").checked;
-      const is_instrumental = document.getElementById("checkInstrumental").checked;
-      
-      const vocal_lora = document.getElementById("selectVocalLora").value || null;
-      const vocal_scale = parseFloat(document.getElementById("rangeVocalScale").value) || 0.8;
-      const style_lora = document.getElementById("selectStyleLora").value || null;
-      const style_scale = parseFloat(document.getElementById("rangeStyleScale").value) || 0.8;
 
       if (!style.trim()) {
-        alert("Укажите стиль музыки!");
+        alert("Укажите описание стиля/инструментов!");
         return;
       }
 
@@ -1301,18 +1401,50 @@
       document.getElementById("btnCreate").classList.add("opacity-50");
       document.getElementById("progressBox").classList.remove("hidden");
 
-      await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title, style, lyrics, cot, cfg_scale, seed, fast_mode, is_instrumental,
-          audio_file: uploadedAudioFilename,
-          abc_score: uploadedMidiAbc || "",
-          midi_source: !!uploadedMidiAbc,
-          vocal_lora, vocal_scale,
-          style_lora, style_scale
-        })
-      });
+      if (currentMode === "loop") {
+        const seconds_total = parseFloat(document.getElementById("rangeLoopDuration").value);
+        const steps = parseInt(document.getElementById("rangeLoopSteps").value);
+        const cfg_scale = parseFloat(document.getElementById("rangeCfg").value);
+
+        await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "loop",
+            title,
+            style,
+            cfg_scale,
+            seed,
+            seconds_total,
+            steps
+          })
+        });
+      } else {
+        const lyrics = document.getElementById("inputLyrics").value;
+        const cot = document.getElementById("selectCot").value;
+        const cfg_scale = parseFloat(document.getElementById("rangeCfg").value);
+        const fast_mode = document.getElementById("checkFast").checked;
+        const is_instrumental = document.getElementById("checkInstrumental").checked;
+        
+        const vocal_lora = document.getElementById("selectVocalLora").value || null;
+        const vocal_scale = parseFloat(document.getElementById("rangeVocalScale").value) || 0.8;
+        const style_lora = document.getElementById("selectStyleLora").value || null;
+        const style_scale = parseFloat(document.getElementById("rangeStyleScale").value) || 0.8;
+
+        await fetch("/api/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "song",
+            title, style, lyrics, cot, cfg_scale, seed, fast_mode, is_instrumental,
+            audio_file: uploadedAudioFilename,
+            abc_score: uploadedMidiAbc || "",
+            midi_source: !!uploadedMidiAbc,
+            vocal_lora, vocal_scale,
+            style_lora, style_scale
+          })
+        });
+      }
 
       pollStatus();
     }

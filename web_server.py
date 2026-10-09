@@ -3,12 +3,15 @@ import gc
 import sys
 import json
 import time
+import types
 import queue
 import shutil
 import inspect
 import threading
 import traceback
 import dataclasses
+import importlib.util
+import importlib.machinery
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -37,7 +40,92 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 os.environ["YUE_ENABLE_FLASH_ATTN"] = "0"
 os.environ["YUE_DISABLE_CUDA_GRAPH"] = "1"
 
+# ---------------------------------------------------------------------
+# 1. Полифилы huggingface_hub и PEFT
+# ---------------------------------------------------------------------
+try:
+    import huggingface_hub
+    import huggingface_hub.errors
+    
+    if not hasattr(huggingface_hub.errors, "CachedRepoTreeNotFoundError"):
+        class CachedRepoTreeNotFoundError(Exception):
+            pass
+        huggingface_hub.errors.CachedRepoTreeNotFoundError = CachedRepoTreeNotFoundError
+        setattr(huggingface_hub, "CachedRepoTreeNotFoundError", CachedRepoTreeNotFoundError)
+
+    if not hasattr(huggingface_hub, "get_cached_repo_tree"):
+        huggingface_hub.get_cached_repo_tree = lambda *args, **kwargs: None
+
+    if hasattr(huggingface_hub, "constants"):
+        if not hasattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER"):
+            setattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER", False)
+except Exception:
+    pass
+
+try:
+    import peft.helpers
+    if not hasattr(peft.helpers, "disable_input_dtype_casting"):
+        from contextlib import contextmanager
+        @contextmanager
+        def _dummy_disable_input_dtype_casting(*args, **kwargs):
+            yield
+        peft.helpers.disable_input_dtype_casting = _dummy_disable_input_dtype_casting
+except Exception:
+    pass
+
+try:
+    from peft import PeftModel
+except ImportError:
+    PeftModel = None
+
+# ---------------------------------------------------------------------
+# 2. Патч валидатора diffusers: исключает падение issubclass()
+# ---------------------------------------------------------------------
+try:
+    import diffusers.pipelines.pipeline_loading_utils as _pipe_loading_utils
+    _orig_maybe_raise_or_warn = _pipe_loading_utils.maybe_raise_or_warn
+
+    def _safe_maybe_raise_or_warn(
+        library_name, library, class_name, importable_classes, passed_class_obj, name, is_pipeline_module
+    ):
+        try:
+            expected_class_obj = getattr(library, class_name, None)
+            if expected_class_obj is None or not isinstance(expected_class_obj, (type, tuple)):
+                return
+            if passed_class_obj is not None and not isinstance(passed_class_obj, (type, tuple)):
+                return
+            return _orig_maybe_raise_or_warn(
+                library_name, library, class_name, importable_classes, passed_class_obj, name, is_pipeline_module
+            )
+        except TypeError:
+            return
+
+    _pipe_loading_utils.maybe_raise_or_warn = _safe_maybe_raise_or_warn
+except Exception:
+    pass
+
+# Нейтрализация требований torchsde
+try:
+    import diffusers.utils.import_utils as _diff_import_utils
+    _orig_requires_backends = _diff_import_utils.requires_backends
+
+    def _patched_requires_backends(obj, backends):
+        if isinstance(backends, (list, tuple, set)):
+            filtered = [b for b in backends if b != "torchsde"]
+            if not filtered:
+                return
+            return _orig_requires_backends(obj, filtered)
+        elif backends == "torchsde":
+            return
+        return _orig_requires_backends(obj, backends)
+
+    _diff_import_utils.requires_backends = _patched_requires_backends
+    _diff_import_utils.is_torchsde_available = lambda: True
+except Exception:
+    pass
+
 import torch
+import torchaudio
 import soundfile as sf
 
 if torch.cuda.is_available():
@@ -59,11 +147,6 @@ try:
 except ImportError:
     m21_converter = None
 
-try:
-    from peft import PeftModel
-except ImportError:
-    PeftModel = None
-
 def safe_resolve(base_dir: Path, subpath: str) -> Path:
     cleaned = Path(subpath).name
     target = (base_dir / cleaned).resolve()
@@ -77,18 +160,13 @@ def safe_track_id(tid: str) -> str:
 CURRENT_TASK_IS_FAST = True
 
 # ---------------------------------------------------------------------
-# Прокси-обертка для NAR модели для гарантированной защиты от нехватки атрибутов
+# Прокси-обертка для NAR модели
 # ---------------------------------------------------------------------
 class SafeNARModelWrapper:
-    """
-    Гарантирует, что обращение к wrapper.model вернет объект,
-    содержащий и embed_tokens, и rotary_emb, и layers.
-    """
     def __init__(self, raw_model):
         self._raw_model = raw_model
         real_backbone = None
         
-        # 1. Проверяем raw_model.model
         if hasattr(raw_model, "model"):
             cand = raw_model.model
             if hasattr(cand, "embed_tokens"):
@@ -96,18 +174,15 @@ class SafeNARModelWrapper:
             elif hasattr(cand, "model") and hasattr(cand.model, "embed_tokens"):
                 real_backbone = cand.model
 
-        # 2. Если не найден, проверяем raw_model напрямую
         if real_backbone is None:
             if hasattr(raw_model, "embed_tokens"):
                 real_backbone = raw_model
             elif hasattr(raw_model, "base_model") and hasattr(raw_model.base_model, "embed_tokens"):
                 real_backbone = raw_model.base_model
 
-        # 3. Дефолтный фоллбэк
         if real_backbone is None:
             real_backbone = getattr(raw_model, "model", raw_model)
 
-        # Проверяем наличие rotary_emb у найденного backbone
         if not hasattr(real_backbone, "rotary_emb"):
             rot_cand = None
             if hasattr(raw_model, "rotary_emb"):
@@ -125,7 +200,6 @@ class SafeNARModelWrapper:
                 except Exception:
                     pass
 
-        # Проверяем наличие embed_tokens
         if not hasattr(real_backbone, "embed_tokens"):
             emb_cand = None
             if hasattr(raw_model, "get_input_embeddings"):
@@ -148,7 +222,7 @@ class SafeNARModelWrapper:
         return self._raw_model(*args, **kwargs)
 
 # ---------------------------------------------------------------------
-# Патч CachedNAR: чанкирование внимания (512 токенов) + применение SafeNARModelWrapper
+# Патчи YuE2
 # ---------------------------------------------------------------------
 ORIG_CACHED_NAR_INIT = yue_nar.CachedNAR.__init__
 
@@ -180,9 +254,6 @@ def patched_cached_nar_init(self, *args, **kwargs):
 
 yue_nar.CachedNAR.__init__ = patched_cached_nar_init
 
-# ---------------------------------------------------------------------
-# Патч NAR Synthesize: безопасная очистка VRAM и шаги диффузии
-# ---------------------------------------------------------------------
 ORIGINAL_NAR_SYNTHESIZE = yue_nar.synthesize
 
 def safe_fast_synthesize(*args, **kwargs):
@@ -232,9 +303,6 @@ def safe_fast_synthesize(*args, **kwargs):
 
 yue_nar.synthesize = safe_fast_synthesize
 
-# ---------------------------------------------------------------------
-# Патч Sampling Generate: безопасная модификация frozen dataclass
-# ---------------------------------------------------------------------
 ORIGINAL_SAMPLING_GENERATE = yue_sampling.generate_tokens
 
 def safe_fast_generate_tokens(model, prefix, sampling=None, seed=42, phase=None, *args, **kwargs):
@@ -278,10 +346,8 @@ def safe_fast_generate_tokens(model, prefix, sampling=None, seed=42, phase=None,
 
     if CURRENT_TASK_IS_FAST and phase == "song" and res is not None:
         if isinstance(res, torch.Tensor) and res.shape[-1] > 3200:
-            print(f"[FAST MODE] Обрезка токенов песни: {res.shape[-1]} -> 3200")
             res = res[..., :3200]
         elif isinstance(res, (list, tuple)) and len(res) > 3200:
-            print(f"[FAST MODE] Обрезка токенов песни: {len(res)} -> 3200")
             res = res[:3200]
 
     return res
@@ -302,6 +368,9 @@ def patch_all_yue_modules():
 
 patch_all_yue_modules()
 
+# ---------------------------------------------------------------------
+# Очередь и управление памятью моделей
+# ---------------------------------------------------------------------
 task_queue = queue.Queue()
 task_lock = threading.Lock()
 current_task = {
@@ -320,9 +389,36 @@ def get_task_state():
         return dict(current_task)
 
 GLOBAL_PIPE = None
+GLOBAL_STABLE_AUDIO_PIPE = None
+
+def unload_pipeline(pipe_type="all"):
+    global GLOBAL_PIPE, GLOBAL_STABLE_AUDIO_PIPE
+    if pipe_type in ("yue", "all") and GLOBAL_PIPE is not None:
+        try:
+            del GLOBAL_PIPE
+        except Exception:
+            pass
+        GLOBAL_PIPE = None
+
+    if pipe_type in ("stable_audio", "all") and GLOBAL_STABLE_AUDIO_PIPE is not None:
+        try:
+            del GLOBAL_STABLE_AUDIO_PIPE
+        except Exception:
+            pass
+        GLOBAL_STABLE_AUDIO_PIPE = None
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+    gc.collect()
 
 def get_pipeline():
     global GLOBAL_PIPE
+    if GLOBAL_STABLE_AUDIO_PIPE is not None:
+        set_task_state(progress_msg="Освобождение VRAM от Stable Audio перед запуском YuE2...")
+        unload_pipeline("stable_audio")
+
     if GLOBAL_PIPE is None:
         set_task_state(progress_msg=f"Загрузка конфигурации YuE2-3B ({device.upper()})...")
         GLOBAL_PIPE = YuE2Pipeline.from_pretrained(
@@ -335,10 +431,43 @@ def get_pipeline():
         patch_all_yue_modules()
     return GLOBAL_PIPE
 
-# =====================================================================
-# БЛОК УПРАВЛЕНИЯ LoRA (Строго AR / MOT модель)
-# =====================================================================
+def get_stable_audio_pipeline():
+    global GLOBAL_STABLE_AUDIO_PIPE
+    if GLOBAL_PIPE is not None:
+        set_task_state(progress_msg="Освобождение VRAM от YuE2 перед запуском Stable Audio...")
+        unload_pipeline("yue")
 
+    if GLOBAL_STABLE_AUDIO_PIPE is None:
+        set_task_state(progress_msg="Инициализация Stable Audio Open 1.0...")
+        from diffusers import StableAudioPipeline
+        from diffusers.schedulers import DPMSolverMultistepScheduler
+
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        hf_token = os.environ.get("HF_TOKEN")
+
+        # 1. Загружаем надежный шедулер из локального кэша
+        fallback_scheduler = DPMSolverMultistepScheduler.from_pretrained(
+            "stabilityai/stable-audio-open-1.0",
+            subfolder="scheduler",
+            cache_dir=str(MODELS_CACHE_DIR),
+            token=hf_token
+        )
+
+        # 2. Инициализируем пайплайн
+        GLOBAL_STABLE_AUDIO_PIPE = StableAudioPipeline.from_pretrained(
+            "stabilityai/stable-audio-open-1.0",
+            scheduler=fallback_scheduler,
+            torch_dtype=dtype,
+            cache_dir=str(MODELS_CACHE_DIR),
+            token=hf_token
+        )
+
+        GLOBAL_STABLE_AUDIO_PIPE = GLOBAL_STABLE_AUDIO_PIPE.to(device)
+    return GLOBAL_STABLE_AUDIO_PIPE
+
+# =====================================================================
+# LoRA менеджмент
+# =====================================================================
 LORA_STATE = {
     "parent_obj": None,
     "ar_attr": None,
@@ -442,7 +571,7 @@ def _scale_single_adapter(peft_model, adapter_name: str, user_scale: float):
                 r_val = r_val.get(adapter_name, 16)
             alpha_val = getattr(module, "lora_alpha", 32)
             if isinstance(alpha_val, dict):
-                alpha_val = alpha_val.get(adapter_name, 32)
+                alpha_val = getattr(module, "lora_alpha", 32)
             base_ratio = float(alpha_val) / float(r_val) if r_val else 1.0
             scaling[adapter_name] = base_ratio * user_scale
 
@@ -465,8 +594,8 @@ def set_active_adapters(peft_model, adapter_names: list[str]):
         if hasattr(peft_model, "set_adapter"):
             try:
                 peft_model.set_adapter(adapter_names[0])
-            except Exception as e:
-                print(f"[LoRA Warning] peft_model.set_adapter({adapter_names[0]}): {e}")
+            except Exception:
+                pass
         return
 
     for module in peft_model.modules():
@@ -504,15 +633,11 @@ def set_active_adapters(peft_model, adapter_names: list[str]):
 def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
     loaded = {"vocal": False, "style": False}
     if PeftModel is None:
-        print("[LoRA Error] Библиотека peft не установлена!")
         return loaded
 
     parent_obj, ar_attr, ar_base = _find_ar_module(pipe)
     if ar_base is None:
-        print("[LoRA Error] Не удалось найти AR/MOT модель в пайплайне.")
         return loaded
-
-    print(f"[LoRA Info] Найдена AR модель для адаптации: {ar_attr} ({type(ar_base).__name__})")
 
     if LORA_STATE["ar_original"] is None:
         LORA_STATE["parent_obj"] = parent_obj
@@ -527,16 +652,16 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
             v_path = safe_resolve(LORAS_DIR, vocal_lora)
             if v_path.exists():
                 adapters_to_load.append(("vocal_adapter", v_path, vocal_scale, "vocal"))
-        except Exception as e:
-            print(f"[LoRA Error] Ошибка пути вокальной LoRA: {e}")
+        except Exception:
+            pass
 
     if style_lora:
         try:
             s_path = safe_resolve(LORAS_DIR, style_lora)
             if s_path.exists():
                 adapters_to_load.append(("style_adapter", s_path, style_scale, "style"))
-        except Exception as e:
-            print(f"[LoRA Error] Ошибка пути стилевой LoRA: {e}")
+        except Exception:
+            pass
 
     if not adapters_to_load:
         return loaded
@@ -555,7 +680,6 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
         _scale_single_adapter(peft_model, first_name, first_scale)
         LORA_STATE["active_adapters"].append(first_name)
         loaded[first_type] = True
-        print(f"[LoRA Info] Успешно загружен адаптер '{first_name}' (скейл {first_scale})")
 
         if len(adapters_to_load) > 1:
             second_name, second_path, second_scale, second_type = adapters_to_load[1]
@@ -564,12 +688,9 @@ def apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale):
             _scale_single_adapter(peft_model, second_name, second_scale)
             LORA_STATE["active_adapters"].append(second_name)
             loaded[second_type] = True
-            print(f"[LoRA Info] Успешно загружен адаптер '{second_name}' (скейл {second_scale})")
 
         active_names = [a[0] for a in adapters_to_load]
         set_active_adapters(peft_model, active_names)
-        print(f"[LoRA Info] Активные адаптеры подключены к AR пайплайну: {active_names}")
-
     except Exception as e:
         print(f"[LoRA Error] Сбой подключения адаптеров: {e}")
 
@@ -608,8 +729,7 @@ def remove_dual_loras(pipe):
                 _set_module_on_parent(parent, attr, original)
         elif original is not None:
             _set_module_on_parent(parent, attr, original)
-    except Exception as e:
-        print(f"[LoRA Warning] Ошибка при отключении адаптеров: {e}")
+    except Exception:
         if original is not None:
             try:
                 _set_module_on_parent(parent, attr, original)
@@ -758,6 +878,9 @@ def generate_fallback_abc(title, style, lyrics):
     ]
     return "\n".join(abc_lines)
 
+# ---------------------------------------------------------------------
+# Главный рабочий поток генерации (YuE2 + Stable Audio)
+# ---------------------------------------------------------------------
 def generation_worker():
     global CURRENT_TASK_IS_FAST
     while True:
@@ -766,134 +889,208 @@ def generation_worker():
             break
 
         task_id = task["id"]
-        set_task_state(status="running", task_id=task_id, progress_msg="Подготовка параметров генерации...", error=None)
+        task_mode = task.get("mode", "song")
+        set_task_state(status="running", task_id=task_id, progress_msg="Подготовка модели...", error=None)
 
-        CURRENT_TASK_IS_FAST = task.get("fast_mode", True)
         start_time = time.time()
         pipe = None
         loras_status = {"vocal": False, "style": False}
 
         try:
-            pipe = get_pipeline()
-            _ensure_pipe_models_loaded(pipe)
-            patch_all_yue_modules()
+            # ---------------------------------------------------------
+            # РЕЖИМ 1: Генерация короткого лупа (Stable Audio Open 1.0)
+            # ---------------------------------------------------------
+            if task_mode == "loop":
+                prompt = task.get("style", "").strip() or "drum loop, acoustic drums, 120 bpm"
+                duration = float(task.get("seconds_total", 8.0))
+                steps = int(task.get("steps", 30))
+                guidance_scale = float(task.get("cfg_scale", 7.0))
+                seed = int(task.get("seed", 42))
 
-            vocal_lora = task.get("vocal_lora")
-            vocal_scale = float(task.get("vocal_scale", 0.8))
-            style_lora = task.get("style_lora")
-            style_scale = float(task.get("style_scale", 0.8))
+                set_task_state(progress_msg=f"Синтез аудиолупа ({duration}s, steps: {steps})...")
+                s_pipe = get_stable_audio_pipeline()
 
-            if vocal_lora or style_lora:
-                set_task_state(progress_msg="Применение адаптеров LoRA (Вокал/Стиль)...")
-                loras_status = apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale)
+                generator = torch.Generator(device=device).manual_seed(seed)
+                output = s_pipe(
+                    prompt=prompt,
+                    negative_prompt=task.get("negative_prompt", "low quality, noisy, distorted, artifact"),
+                    num_inference_steps=steps,
+                    audio_end_in_s=duration,
+                    num_waveforms_per_prompt=1,
+                    guidance_scale=guidance_scale,
+                    generator=generator
+                )
 
-            style = task["style"]
-            if task.get("is_instrumental", False):
-                if "instrumental" not in style.lower():
-                    style = f"instrumental, {style}"
-                lyrics = "[intro]\n[inst]\n\n[verse]\n[inst]\n\n[chorus]\n[inst]\n\n[outro]\n[inst]"
+                audio_tensor = output.audios[0]  # [channels, samples]
+                sr = s_pipe.vae.sampling_rate
+
+                filename = f"loop_{task_id}.flac"
+                file_path = safe_resolve(TRACKS_DIR, filename)
+
+                if audio_tensor.is_cuda:
+                    audio_tensor = audio_tensor.cpu()
+                audio_np = audio_tensor.float().numpy()
+
+                if audio_np.ndim == 2 and audio_np.shape[0] < audio_np.shape[1]:
+                    audio_np = audio_np.T
+
+                sf.write(str(file_path), audio_np, sr)
+                duration_sec = round(time.time() - start_time)
+
+                history = load_history()
+                history.insert(0, {
+                    "id": task_id,
+                    "title": task.get("title") or f"Audio Loop #{task_id[:6]}",
+                    "style": prompt,
+                    "lyrics": "",
+                    "cot": "off",
+                    "cfg_scale": guidance_scale,
+                    "seed": seed,
+                    "fast_mode": False,
+                    "is_instrumental": True,
+                    "is_loop": True,
+                    "loop_duration": f"{duration}s",
+                    "reference_audio": None,
+                    "vocal_lora": None,
+                    "vocal_scale": None,
+                    "style_lora": None,
+                    "style_scale": None,
+                    "has_abc": False,
+                    "is_midi_gen": False,
+                    "filename": filename,
+                    "url": f"/audio/{filename}",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "duration_render": f"{duration_sec}s",
+                    "rating": 0
+                })
+                save_history(history)
+                set_task_state(status="completed", progress_msg=f"Луп готов за {duration_sec} сек!")
+
+            # ---------------------------------------------------------
+            # РЕЖИМ 2: Стандартная генерация трека YuE2-3B
+            # ---------------------------------------------------------
             else:
-                lyrics = task.get("lyrics", "").strip()
-                if not lyrics:
-                    lyrics = "[verse]\nInstrumental melody\n[chorus]\nAtmospheric sound"
+                CURRENT_TASK_IS_FAST = task.get("fast_mode", True)
+                pipe = get_pipeline()
+                _ensure_pipe_models_loaded(pipe)
+                patch_all_yue_modules()
 
-            audio_file = task.get("audio_file")
-            custom_abc = task.get("abc_score", "").strip()
+                vocal_lora = task.get("vocal_lora")
+                vocal_scale = float(task.get("vocal_scale", 0.8))
+                style_lora = task.get("style_lora")
+                style_scale = float(task.get("style_scale", 0.8))
 
-            gen_kwargs = {
-                "style": style,
-                "lyrics": lyrics,
-                "cfg_scale": float(task.get("cfg_scale", 1.2)),
-                "seed": int(task.get("seed", 42))
-            }
+                if vocal_lora or style_lora:
+                    set_task_state(progress_msg="Применение адаптеров LoRA (Вокал/Стиль)...")
+                    loras_status = apply_dual_loras(pipe, vocal_lora, vocal_scale, style_lora, style_scale)
 
-            if custom_abc:
-                set_task_state(progress_msg="Синтез по партитуре (MIDI/ABC)...")
-                gen_kwargs["abc"] = sanitize_abc_notation(custom_abc, task.get("title") or "Track")
-                gen_kwargs["cot"] = "melody"
-            else:
-                chosen_cot = "melody" if audio_file else task.get("cot", "full")
-                set_task_state(progress_msg=f"Символическое планирование (cot='{chosen_cot}')...")
-                gen_kwargs["cot"] = chosen_cot
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-
-            song = pipe(**gen_kwargs)
-
-            set_task_state(progress_msg="Сохранение аудио и нотных артефактов...")
-            filename = f"track_{task_id}.flac"
-            file_path = safe_resolve(TRACKS_DIR, filename)
-
-            if hasattr(song, "save"):
-                song.save(str(file_path))
-            else:
-                audio_data = song.audio if hasattr(song, "audio") else song
-                if isinstance(audio_data, torch.Tensor):
-                    audio_data = audio_data.detach().cpu().float().numpy()
-                if audio_data.ndim == 2 and audio_data.shape[0] < audio_data.shape[1]:
-                    audio_data = audio_data.T
-                sf.write(str(file_path), audio_data, 48000)
-
-            clean_tid = safe_track_id(task_id)
-            track_artifacts_dir = safe_resolve(ARTIFACTS_BASE_DIR, clean_tid)
-            track_artifacts_dir.mkdir(parents=True, exist_ok=True)
-            target_score_file = track_artifacts_dir / "score.abc"
-
-            saved_abc_text = None
-            if custom_abc:
-                saved_abc_text = custom_abc
-            elif hasattr(song, "abc") and song.abc:
-                saved_abc_text = str(song.abc)
-            elif hasattr(song, "score") and song.score:
-                saved_abc_text = str(song.score)
-
-            if hasattr(song, "save_artifacts"):
-                try:
-                    song.save_artifacts(str(track_artifacts_dir))
-                except Exception:
-                    pass
-
-            if not target_score_file.exists():
-                found_abcs = list(track_artifacts_dir.rglob("*.abc"))
-                if found_abcs:
-                    shutil.copyfile(found_abcs[0], target_score_file)
-                elif saved_abc_text:
-                    target_score_file.write_text(saved_abc_text, encoding="utf-8")
+                style = task["style"]
+                if task.get("is_instrumental", False):
+                    if "instrumental" not in style.lower():
+                        style = f"instrumental, {style}"
+                    lyrics = "[intro]\n[inst]\n\n[verse]\n[inst]\n\n[chorus]\n[inst]\n\n[outro]\n[inst]"
                 else:
-                    fallback_text = generate_fallback_abc(task.get("title"), style, lyrics)
-                    target_score_file.write_text(fallback_text, encoding="utf-8")
+                    lyrics = task.get("lyrics", "").strip()
+                    if not lyrics:
+                        lyrics = "[verse]\nInstrumental melody\n[chorus]\nAtmospheric sound"
 
-            duration_sec = round(time.time() - start_time)
+                audio_file = task.get("audio_file")
+                custom_abc = task.get("abc_score", "").strip()
 
-            history = load_history()
-            history.insert(0, {
-                "id": task_id,
-                "title": task.get("title") or f"YuE2 Track #{task_id[:6]}",
-                "style": style,
-                "lyrics": lyrics,
-                "cot": gen_kwargs["cot"],
-                "cfg_scale": task.get("cfg_scale", 1.2),
-                "seed": task.get("seed", 42),
-                "fast_mode": CURRENT_TASK_IS_FAST,
-                "is_instrumental": task.get("is_instrumental", False),
-                "reference_audio": audio_file,
-                "vocal_lora": vocal_lora if loras_status["vocal"] else None,
-                "vocal_scale": vocal_scale if loras_status["vocal"] else None,
-                "style_lora": style_lora if loras_status["style"] else None,
-                "style_scale": style_scale if loras_status["style"] else None,
-                "has_abc": True,
-                "is_midi_gen": bool(task.get("midi_source", False)),
-                "filename": filename,
-                "url": f"/audio/{filename}",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "duration_render": f"{duration_sec}s",
-                "rating": 0
-            })
-            save_history(history)
+                gen_kwargs = {
+                    "style": style,
+                    "lyrics": lyrics,
+                    "cfg_scale": float(task.get("cfg_scale", 1.2)),
+                    "seed": int(task.get("seed", 42))
+                }
 
-            set_task_state(status="completed", progress_msg=f"Готово за {duration_sec} сек!")
+                if custom_abc:
+                    set_task_state(progress_msg="Синтез по партитуре (MIDI/ABC)...")
+                    gen_kwargs["abc"] = sanitize_abc_notation(custom_abc, task.get("title") or "Track")
+                    gen_kwargs["cot"] = "melody"
+                else:
+                    chosen_cot = "melody" if audio_file else task.get("cot", "full")
+                    set_task_state(progress_msg=f"Символическое планирование (cot='{chosen_cot}')...")
+                    gen_kwargs["cot"] = chosen_cot
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+                song = pipe(**gen_kwargs)
+
+                set_task_state(progress_msg="Сохранение аудио и нотных артефактов...")
+                filename = f"track_{task_id}.flac"
+                file_path = safe_resolve(TRACKS_DIR, filename)
+
+                if hasattr(song, "save"):
+                    song.save(str(file_path))
+                else:
+                    audio_data = song.audio if hasattr(song, "audio") else song
+                    if isinstance(audio_data, torch.Tensor):
+                        audio_data = audio_data.detach().cpu().float().numpy()
+                    if audio_data.ndim == 2 and audio_data.shape[0] < audio_data.shape[1]:
+                        audio_data = audio_data.T
+                    sf.write(str(file_path), audio_data, 48000)
+
+                clean_tid = safe_track_id(task_id)
+                track_artifacts_dir = safe_resolve(ARTIFACTS_BASE_DIR, clean_tid)
+                track_artifacts_dir.mkdir(parents=True, exist_ok=True)
+                target_score_file = track_artifacts_dir / "score.abc"
+
+                saved_abc_text = None
+                if custom_abc:
+                    saved_abc_text = custom_abc
+                elif hasattr(song, "abc") and song.abc:
+                    saved_abc_text = str(song.abc)
+                elif hasattr(song, "score") and song.score:
+                    saved_abc_text = str(song.score)
+
+                if hasattr(song, "save_artifacts"):
+                    try:
+                        song.save_artifacts(str(track_artifacts_dir))
+                    except Exception:
+                        pass
+
+                if not target_score_file.exists():
+                    found_abcs = list(track_artifacts_dir.rglob("*.abc"))
+                    if found_abcs:
+                        shutil.copyfile(found_abcs[0], target_score_file)
+                    elif saved_abc_text:
+                        target_score_file.write_text(saved_abc_text, encoding="utf-8")
+                    else:
+                        fallback_text = generate_fallback_abc(task.get("title"), style, lyrics)
+                        target_score_file.write_text(fallback_text, encoding="utf-8")
+
+                duration_sec = round(time.time() - start_time)
+
+                history = load_history()
+                history.insert(0, {
+                    "id": task_id,
+                    "title": task.get("title") or f"YuE2 Track #{task_id[:6]}",
+                    "style": style,
+                    "lyrics": lyrics,
+                    "cot": gen_kwargs["cot"],
+                    "cfg_scale": task.get("cfg_scale", 1.2),
+                    "seed": task.get("seed", 42),
+                    "fast_mode": CURRENT_TASK_IS_FAST,
+                    "is_instrumental": task.get("is_instrumental", False),
+                    "is_loop": False,
+                    "reference_audio": audio_file,
+                    "vocal_lora": vocal_lora if loras_status["vocal"] else None,
+                    "vocal_scale": vocal_scale if loras_status["vocal"] else None,
+                    "style_lora": style_lora if loras_status["style"] else None,
+                    "style_scale": style_scale if loras_status["style"] else None,
+                    "has_abc": True,
+                    "is_midi_gen": bool(task.get("midi_source", False)),
+                    "filename": filename,
+                    "url": f"/audio/{filename}",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "duration_render": f"{duration_sec}s",
+                    "rating": 0
+                })
+                save_history(history)
+                set_task_state(status="completed", progress_msg=f"Готово за {duration_sec} сек!")
 
         except Exception as e:
             traceback.print_exc()
@@ -926,9 +1123,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        # -------------------------------------------------------------
-        # Статика Demucs Web (Экстракция стэмов)
-        # -------------------------------------------------------------
+        # Статика demucs-web
         if parsed.path.startswith("/demucs-web"):
             subpath = parsed.path.replace("/demucs-web", "").lstrip("/")
             if not subpath or subpath == "":
@@ -1382,16 +1577,21 @@ class StudioHandler(SimpleHTTPRequestHandler):
             task_id = str(int(time.time() * 1000))
             raw_audio = data.get("audio_file")
             clean_audio = Path(raw_audio).name if raw_audio else None
+            task_mode = data.get("mode", "song")
+
             task_item = {
                 "id": task_id,
+                "mode": task_mode,
                 "title": data.get("title", "").strip(),
                 "style": data.get("style", "").strip(),
                 "lyrics": data.get("lyrics", "").strip(),
                 "cot": data.get("cot", "melody"),
-                "cfg_scale": float(data.get("cfg_scale", 1.2)),
+                "cfg_scale": float(data.get("cfg_scale", 7.0 if task_mode == "loop" else 1.2)),
                 "seed": int(data.get("seed", 42)),
                 "fast_mode": bool(data.get("fast_mode", True)),
                 "is_instrumental": bool(data.get("is_instrumental", False)),
+                "seconds_total": float(data.get("seconds_total", 8.0)),
+                "steps": int(data.get("steps", 30)),
                 "audio_file": clean_audio,
                 "abc_score": data.get("abc_score", ""),
                 "midi_source": bool(data.get("midi_source", False)),
