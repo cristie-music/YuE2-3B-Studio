@@ -26,6 +26,7 @@
 ## Как запустить в облаке
 
 1. Зарегистрируйся на https://huggingface.co/ и получи API токен (https://huggingface.co/settings/tokens)
+(Если хочешь использовать лупы , зайди на https://huggingface.co/stabilityai/stable-audio-open-1.0 и прими соглашение)
 2. Зарегистрируйся на https://ngrok.com и получи API токен (https://dashboard.ngrok.com/authtokens)
 3. Перемещайся в EU или USA регион (вжух и ты в Америке или Амстердаме)
 4. Залогинься в свою Google учетку
