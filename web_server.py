@@ -41,12 +41,12 @@ os.environ["YUE_ENABLE_FLASH_ATTN"] = "0"
 os.environ["YUE_DISABLE_CUDA_GRAPH"] = "1"
 
 # ---------------------------------------------------------------------
-# 1. Полифилы huggingface_hub и PEFT
+# 1. Корректные полифилы huggingface_hub и PEFT для Offline-режима
 # ---------------------------------------------------------------------
 try:
     import huggingface_hub
     import huggingface_hub.errors
-    
+
     if not hasattr(huggingface_hub.errors, "CachedRepoTreeNotFoundError"):
         class CachedRepoTreeNotFoundError(Exception):
             pass
@@ -54,7 +54,33 @@ try:
         setattr(huggingface_hub, "CachedRepoTreeNotFoundError", CachedRepoTreeNotFoundError)
 
     if not hasattr(huggingface_hub, "get_cached_repo_tree"):
-        huggingface_hub.get_cached_repo_tree = lambda *args, **kwargs: None
+        class _LocalCachedFile:
+            def __init__(self, relative_path):
+                self.path = relative_path
+
+        def _fallback_get_cached_repo_tree(repo_id, repo_type="model", cache_dir=None, revision=None):
+            c_dir = Path(cache_dir or MODELS_CACHE_DIR)
+            folder_name = f"{repo_type}s--{repo_id.replace('/', '--')}"
+            repo_folder = c_dir / folder_name
+            snapshots = repo_folder / "snapshots"
+            if not snapshots.exists():
+                return None
+            rev_dirs = [d for d in snapshots.iterdir() if d.is_dir()]
+            if not rev_dirs:
+                return None
+            target_snap = rev_dirs[0]
+            if revision:
+                for d in rev_dirs:
+                    if d.name == revision:
+                        target_snap = d
+                        break
+            files = []
+            for p in target_snap.rglob("*"):
+                if p.is_file():
+                    files.append(_LocalCachedFile(str(p.relative_to(target_snap)).replace("\\", "/")))
+            return files
+
+        huggingface_hub.get_cached_repo_tree = _fallback_get_cached_repo_tree
 
     if hasattr(huggingface_hub, "constants"):
         if not hasattr(huggingface_hub.constants, "HF_HUB_ENABLE_HF_TRANSFER"):
@@ -157,6 +183,22 @@ def safe_resolve(base_dir: Path, subpath: str) -> Path:
 def safe_track_id(tid: str) -> str:
     return "".join(c for c in str(tid) if c.isalnum() or c in ("_", "-"))
 
+def resolve_cached_repo_folder(repo_id: str, repo_type: str = "models") -> Path | None:
+    folder_prefix = f"{repo_type}--{repo_id.replace('/', '--')}"
+    repo_root = MODELS_CACHE_DIR / folder_prefix
+    if not repo_root.exists():
+        repo_root = MODELS_CACHE_DIR / "hub" / folder_prefix
+    if not repo_root.exists():
+        return None
+
+    snapshots = repo_root / "snapshots"
+    if snapshots.exists():
+        subdirs = [d for d in snapshots.iterdir() if d.is_dir()]
+        if subdirs:
+            subdirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            return subdirs[0]
+    return repo_root
+
 CURRENT_TASK_IS_FAST = True
 
 # ---------------------------------------------------------------------
@@ -166,7 +208,7 @@ class SafeNARModelWrapper:
     def __init__(self, raw_model):
         self._raw_model = raw_model
         real_backbone = None
-        
+
         if hasattr(raw_model, "model"):
             cand = raw_model.model
             if hasattr(cand, "embed_tokens"):
@@ -444,22 +486,46 @@ def get_stable_audio_pipeline():
 
         dtype = torch.float16 if device == "cuda" else torch.float32
         hf_token = os.environ.get("HF_TOKEN")
-
-        # 1. Загружаем надежный шедулер из локального кэша
-        fallback_scheduler = DPMSolverMultistepScheduler.from_pretrained(
-            "stabilityai/stable-audio-open-1.0",
-            subfolder="scheduler",
-            cache_dir=str(MODELS_CACHE_DIR),
-            token=hf_token
+        is_offline = (
+            os.environ.get("HF_HUB_OFFLINE") == "1"
+            or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
         )
 
-        # 2. Инициализируем пайплайн
+        model_source = "stabilityai/stable-audio-open-1.0"
+        cached_snapshot = resolve_cached_repo_folder("stabilityai/stable-audio-open-1.0")
+
+        # Принудительно используем локальный snapshot, чтобы не опрашивать удалённый Hub
+        if is_offline and cached_snapshot and cached_snapshot.exists():
+            model_source = str(cached_snapshot)
+
+        # 1. Загрузка шедулера
+        scheduler_source = model_source
+        subfolder_val = "scheduler" if not (Path(model_source) / "scheduler_config.json").exists() else None
+
+        try:
+            fallback_scheduler = DPMSolverMultistepScheduler.from_pretrained(
+                scheduler_source,
+                subfolder=subfolder_val,
+                cache_dir=str(MODELS_CACHE_DIR),
+                token=hf_token,
+                local_files_only=is_offline
+            )
+        except Exception:
+            fallback_scheduler = DPMSolverMultistepScheduler.from_pretrained(
+                "stabilityai/stable-audio-open-1.0",
+                subfolder="scheduler",
+                cache_dir=str(MODELS_CACHE_DIR),
+                token=hf_token
+            )
+
+        # 2. Инициализация пайплайна
         GLOBAL_STABLE_AUDIO_PIPE = StableAudioPipeline.from_pretrained(
-            "stabilityai/stable-audio-open-1.0",
+            model_source,
             scheduler=fallback_scheduler,
-            torch_dtype=dtype,
+            dtype=dtype,
             cache_dir=str(MODELS_CACHE_DIR),
-            token=hf_token
+            token=hf_token,
+            local_files_only=is_offline
         )
 
         GLOBAL_STABLE_AUDIO_PIPE = GLOBAL_STABLE_AUDIO_PIPE.to(device)
