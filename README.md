@@ -23,7 +23,7 @@
 ---
 
 ## Collab (Cloud version)
-[https://github.com/cristie-music/YuE2-3B-Studio](https://github.com/cristie-music/YuE2-3B-Studio)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cristie-music/YuE2-3B-Studio/blob/main/YuE2_3B_Studio_Colab.ipynb)
 
 ## Архитектура и оптимизации для 16 GB VRAM
 
