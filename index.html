@@ -1147,6 +1147,11 @@
       } catch (e) {}
     }
 
+    function extractStems(fullAudioUrl) {
+      const targetUrl = `/demucs-web/?audioUrl=${fullAudioUrl}`;
+      window.open(targetUrl, '_blank');
+    }
+
     function renderHistoryItems(list) {
       const container = document.getElementById("historyList");
       if (list.length === 0) {
@@ -1220,6 +1225,10 @@
                   <a href="/api/midi?id=${item.id}" download="track_${item.id}.mid" class="px-2 py-1 rounded-md text-xs bg-purple-500/15 hover:bg-purple-500/25 text-purple-300 transition-colors flex items-center gap-1" title="Экспорт в MIDI">
                     <span>♫</span> MIDI
                   </a>
+
+                  <button onclick="extractStems('${encodeURIComponent(window.location.origin + item.url)}')" class="px-2 py-1 rounded-md text-xs bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 transition-colors flex items-center gap-1" title="Разделить на 4 стэма в Demucs">
+                    <span>✂</span> Stems
+                  </button>
 
                   <button onclick='recreateTrack(${JSON.stringify(item).replace(/'/g, "&apos;")})' class="px-2 py-1 rounded-md text-xs bg-white/5 hover:bg-white/10 text-zinc-300 hover:text-white transition-colors flex items-center gap-1">
                     <span>↻</span> Повторить

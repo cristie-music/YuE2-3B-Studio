@@ -86,7 +86,6 @@ class SafeNARModelWrapper:
     """
     def __init__(self, raw_model):
         self._raw_model = raw_model
-        # Ищем настоящий backbone (где лежат embed_tokens и layers)
         real_backbone = None
         
         # 1. Проверяем raw_model.model
@@ -157,7 +156,6 @@ def patched_cached_nar_init(self, *args, **kwargs):
     call_args = list(args)
     call_kwargs = dict(kwargs)
 
-    # Нормализуем переданную модель через безопасную обертку
     if len(call_args) > 0:
         call_args[0] = SafeNARModelWrapper(call_args[0])
     elif "model" in call_kwargs:
@@ -197,7 +195,6 @@ def safe_fast_synthesize(*args, **kwargs):
     call_args = list(args)
     call_kwargs = dict(kwargs)
 
-    # Оборачиваем модель на входе в synthesize
     if len(call_args) > 0:
         call_args[0] = SafeNARModelWrapper(call_args[0])
     elif "model" in call_kwargs:
@@ -366,14 +363,12 @@ def _ensure_pipe_models_loaded(pipe):
 def _find_ar_module(pipe):
     _ensure_pipe_models_loaded(pipe)
 
-    # 1. Поиск по прямым именам компонентов
     for name in _AR_STRICT_CANDIDATES:
         if hasattr(pipe, name):
             val = getattr(pipe, name)
             if val is not None and isinstance(val, torch.nn.Module):
                 return pipe, name, val
 
-    # 2. Поиск в словарях компонентов
     for container_name in ("models", "modules", "components", "submodules"):
         if hasattr(pipe, container_name):
             container = getattr(pipe, container_name)
@@ -382,7 +377,6 @@ def _find_ar_module(pipe):
                     if name in container and isinstance(container[name], torch.nn.Module):
                         return container, name, container[name]
 
-    # 3. Эвристический поиск: любой трансформер, кроме VAE и NAR (pipe.model)
     for attr in dir(pipe):
         if attr.startswith("__") or attr in ("vae", "model"):
             continue
@@ -932,6 +926,43 @@ class StudioHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
+        # -------------------------------------------------------------
+        # Статика Demucs Web (Экстракция стэмов)
+        # -------------------------------------------------------------
+        if parsed.path.startswith("/demucs-web"):
+            subpath = parsed.path.replace("/demucs-web", "").lstrip("/")
+            if not subpath or subpath == "":
+                subpath = "index.html"
+            target_file = (BASE_DIR / "demucs-web" / subpath).resolve()
+
+            if not target_file.is_relative_to((BASE_DIR / "demucs-web").resolve()):
+                self.send_error(403, "Forbidden")
+                return
+
+            if not target_file.exists() or not target_file.is_file():
+                self.send_error(404, "File not found")
+                return
+
+            ext = target_file.suffix.lower()
+            mime_map = {
+                ".html": "text/html; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+                ".mjs": "application/javascript; charset=utf-8",
+                ".json": "application/json; charset=utf-8",
+                ".css": "text/css; charset=utf-8",
+                ".wasm": "application/wasm",
+                ".onnx": "application/octet-stream"
+            }
+            content_type = mime_map.get(ext, "application/octet-stream")
+
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(target_file.stat().st_size))
+            self.end_headers()
+            with open(target_file, "rb") as f:
+                self.wfile.write(f.read())
+            return
+
         if parsed.path in ["/", "/index.html"]:
             html_path = BASE_DIR / "index.html"
             if html_path.exists():
@@ -1396,6 +1427,7 @@ def run_server(port=7860):
     print("=" * 65)
     print(f" YuE2-3B Studio Server запущен на бэкенде: {device.upper()}")
     print(f" Каталог адаптеров LoRA: {LORAS_DIR}")
+    print(f" Модуль стэмов Demucs Web: http://127.0.0.1:{port}/demucs-web/")
     print(f" Доступ в браузере: http://127.0.0.1:{port}")
     print("=" * 65)
     server.serve_forever()
