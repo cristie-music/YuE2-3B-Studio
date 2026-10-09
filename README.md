@@ -23,7 +23,17 @@
 ---
 
 ## Collab (Cloud version)
+## Как запустить в облаке
+
+1. Зарегистрируйся на https://huggingface.co/ и получи API токен (https://huggingface.co/settings/tokens)
+2. Зарегистрируйся на https://ngrok.com и получи API токен (https://dashboard.ngrok.com/authtokens)
+3. Перемещайся в EU или USA регион (вжух и ты в Америке или Амстердаме)
+4. Залогинься в свою Google учетку
+5. Открой ссылку в Colab ниже
+
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cristie-music/YuE2-3B-Studio/blob/main/YuE2_3B_Studio_Colab.ipynb)
+
+
 
 ## Архитектура и оптимизации для 16 GB VRAM
 
