@@ -36,8 +36,7 @@ PERSONAS_FILE = BASE_DIR / "personas.json"
 os.environ["HF_HOME"] = str(MODELS_CACHE_DIR)
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-# Предотвращение фрагментации аллокатора и утечек памяти на GPU
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64,garbage_collection_threshold:0.7"
 os.environ["YUE_ENABLE_FLASH_ATTN"] = "0"
 os.environ["YUE_DISABLE_CUDA_GRAPH"] = "1"
 
@@ -420,63 +419,32 @@ def get_task_state():
 
 GLOBAL_PIPE = None
 GLOBAL_STABLE_AUDIO_PIPE = None
-DEMUCS_SESSION = None
-
-def force_cuda_cleanup():
-    """Глубокая очистка памяти GPU: выгрузка KV-кэша, сбор мусора и сброс аллокатора"""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
 
 def unload_pipeline(pipe_type="all"):
-    """Полная выгрузка нейросетевых объектов с принудительным переносом тензоров на CPU"""
-    global GLOBAL_PIPE, GLOBAL_STABLE_AUDIO_PIPE, DEMUCS_SESSION
-
-    # 1. Выгрузка YuE2
+    global GLOBAL_PIPE, GLOBAL_STABLE_AUDIO_PIPE
     if pipe_type in ("yue", "all") and GLOBAL_PIPE is not None:
         try:
-            for attr in ("_model", "stage1_model", "stage2_model", "vae", "model"):
-                if hasattr(GLOBAL_PIPE, attr):
-                    sub = getattr(GLOBAL_PIPE, attr)
-                    if hasattr(sub, "to"):
-                        try:
-                            sub.to("cpu")
-                        except Exception:
-                            pass
-                    del sub
-                    setattr(GLOBAL_PIPE, attr, None)
             del GLOBAL_PIPE
         except Exception:
             pass
         GLOBAL_PIPE = None
 
-    # 2. Выгрузка Stable Audio
     if pipe_type in ("stable_audio", "all") and GLOBAL_STABLE_AUDIO_PIPE is not None:
         try:
-            if hasattr(GLOBAL_STABLE_AUDIO_PIPE, "to"):
-                GLOBAL_STABLE_AUDIO_PIPE.to("cpu")
             del GLOBAL_STABLE_AUDIO_PIPE
         except Exception:
             pass
         GLOBAL_STABLE_AUDIO_PIPE = None
 
-    # 3. Выгрузка Demucs ONNX Runtime
-    if pipe_type in ("demucs", "all") and DEMUCS_SESSION is not None:
-        try:
-            del DEMUCS_SESSION
-        except Exception:
-            pass
-        DEMUCS_SESSION = None
-
-    force_cuda_cleanup()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 def get_pipeline():
     global GLOBAL_PIPE
-    unload_pipeline("stable_audio")
-    unload_pipeline("demucs")
-    force_cuda_cleanup()
+    if GLOBAL_STABLE_AUDIO_PIPE is not None:
+        set_task_state(progress_msg="Освобождение VRAM от Stable Audio...")
+        unload_pipeline("stable_audio")
 
     if GLOBAL_PIPE is None:
         set_task_state(progress_msg=f"Загрузка YuE2-3B в VRAM...")
@@ -492,9 +460,9 @@ def get_pipeline():
 
 def get_stable_audio_pipeline():
     global GLOBAL_STABLE_AUDIO_PIPE
-    unload_pipeline("yue")
-    unload_pipeline("demucs")
-    force_cuda_cleanup()
+    if GLOBAL_PIPE is not None:
+        set_task_state(progress_msg="Освобождение VRAM от YuE2...")
+        unload_pipeline("yue")
 
     if GLOBAL_STABLE_AUDIO_PIPE is None:
         set_task_state(progress_msg="Инициализация Stable Audio Open 1.0...")
@@ -546,9 +514,14 @@ def get_stable_audio_pipeline():
     return GLOBAL_STABLE_AUDIO_PIPE
 
 # =====================================================================
+# Серверный экстрактор стэмов Demucs на GPU
+# =====================================================================
+# =====================================================================
 # Серверный экстрактор стэмов Demucs
 # =====================================================================
-def get_server_demucs_session(prefer_gpu=True):
+DEMUCS_SESSION = None
+
+def get_server_demucs_session():
     global DEMUCS_SESSION
     if DEMUCS_SESSION is None:
         import onnxruntime as ort
@@ -569,22 +542,19 @@ def get_server_demucs_session(prefer_gpu=True):
 
         sess_opt = ort.SessionOptions()
         sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-
-        # Динамическая арена памяти (kNextPowerOfTwo) с достаточным лимитом под свертки
+        
+        # Отключаем сбойные эвристики cuDNN v9 для стабильности на T4 GPU
         cuda_options = {
             "device_id": 0,
             "arena_extend_strategy": "kNextPowerOfTwo",
-            "gpu_mem_limit": 3500 * 1024 * 1024,
-            "cudnn_conv_algo_search": "HEURISTIC"
+            "gpu_mem_limit": 4 * 1024 * 1024 * 1024,
+            "cudnn_conv_algo_search": "DEFAULT"
         }
-
-        if prefer_gpu and torch.cuda.is_available():
-            providers = [
-                ("CUDAExecutionProvider", cuda_options),
-                "CPUExecutionProvider"
-            ]
-        else:
-            providers = ["CPUExecutionProvider"]
+        
+        providers = [
+            ("CUDAExecutionProvider", cuda_options),
+            "CPUExecutionProvider"
+        ] if torch.cuda.is_available() else ["CPUExecutionProvider"]
 
         try:
             DEMUCS_SESSION = ort.InferenceSession(str(model_path), sess_opt, providers=providers)
@@ -621,126 +591,122 @@ def run_server_demucs_separation(audio_path: Path, output_dir: Path):
     outputs = [np.zeros((2, total_samples), dtype=np.float32) for _ in range(4)]
     weights = np.zeros(total_samples, dtype=np.float32)
 
-    session = get_server_demucs_session(prefer_gpu=True)
+    session = get_server_demucs_session()
     input_names = [inp.name for inp in session.get_inputs()]
+    output_names = [out.name for out in session.get_outputs()]
     fade_len = int(stride * 0.5)
 
     window_hann = torch.hann_window(fft_size)
 
-    try:
-        for start in range(0, total_samples, stride):
-            end = min(start + training_samples, total_samples)
-            seg_len = end - start
+    for start in range(0, total_samples, stride):
+        end = min(start + training_samples, total_samples)
+        seg_len = end - start
 
-            seg_l = np.zeros(training_samples, dtype=np.float32)
-            seg_r = np.zeros(training_samples, dtype=np.float32)
-            seg_l[:seg_len] = left_ch[start:end]
-            seg_r[:seg_len] = right_ch[start:end]
+        seg_l = np.zeros(training_samples, dtype=np.float32)
+        seg_r = np.zeros(training_samples, dtype=np.float32)
+        seg_l[:seg_len] = left_ch[start:end]
+        seg_r[:seg_len] = right_ch[start:end]
 
-            waveform_in = np.stack([seg_l, seg_r], axis=0)[np.newaxis, ...]
-            feeds = {input_names[0]: waveform_in}
+        waveform_in = np.stack([seg_l, seg_r], axis=0)[np.newaxis, ...]
+        feeds = {input_names[0]: waveform_in}
 
-            if len(input_names) > 1:
-                pad_val = int(hop_size // 2 * 3)
-                le = int(np.ceil(training_samples / hop_size))
-                pad_right = pad_val + le * hop_size - training_samples
+        if len(input_names) > 1:
+            pad_val = int(hop_size // 2 * 3)
+            le = int(np.ceil(training_samples / hop_size))
+            pad_right = pad_val + le * hop_size - training_samples
 
-                p_l = np.pad(seg_l, (pad_val, pad_right), mode='reflect')
-                p_r = np.pad(seg_r, (pad_val, pad_right), mode='reflect')
-                center_pad = fft_size // 2
-                p_l = np.pad(p_l, (center_pad, center_pad), mode='reflect')
-                p_r = np.pad(p_r, (center_pad, center_pad), mode='reflect')
+            p_l = np.pad(seg_l, (pad_val, pad_right), mode='reflect')
+            p_r = np.pad(seg_r, (pad_val, pad_right), mode='reflect')
+            center_pad = fft_size // 2
+            p_l = np.pad(p_l, (center_pad, center_pad), mode='reflect')
+            p_r = np.pad(p_r, (center_pad, center_pad), mode='reflect')
 
-                tl = torch.from_numpy(p_l)
-                tr = torch.from_numpy(p_r)
+            tl = torch.from_numpy(p_l)
+            tr = torch.from_numpy(p_r)
 
-                stft_l = torch.stft(tl, fft_size, hop_length=hop_size, window=window_hann, return_complex=True)
-                stft_r = torch.stft(tr, fft_size, hop_length=hop_size, window=window_hann, return_complex=True)
-                scale = 1.0 / np.sqrt(fft_size)
+            stft_l = torch.stft(tl, fft_size, hop_length=hop_size, window=window_hann, return_complex=True)
+            stft_r = torch.stft(tr, fft_size, hop_length=hop_size, window=window_hann, return_complex=True)
+            scale = 1.0 / np.sqrt(fft_size)
 
-                spec_l = stft_l[:, 2:2+336] * scale
-                spec_r = stft_r[:, 2:2+336] * scale
+            spec_l = stft_l[:, 2:2+336] * scale
+            spec_r = stft_r[:, 2:2+336] * scale
 
-                mag_spec = np.zeros((1, 4, 2048, 336), dtype=np.float32)
-                mag_spec[0, 0] = spec_l.real[:2048, :336].numpy()
-                mag_spec[0, 1] = spec_l.imag[:2048, :336].numpy()
-                mag_spec[0, 2] = spec_r.real[:2048, :336].numpy()
-                mag_spec[0, 3] = spec_r.imag[:2048, :336].numpy()
-                feeds[input_names[1]] = mag_spec
+            mag_spec = np.zeros((1, 4, 2048, 336), dtype=np.float32)
+            mag_spec[0, 0] = spec_l.real[:2048, :336].numpy()
+            mag_spec[0, 1] = spec_l.imag[:2048, :336].numpy()
+            mag_spec[0, 2] = spec_r.real[:2048, :336].numpy()
+            mag_spec[0, 3] = spec_r.imag[:2048, :336].numpy()
+            feeds[input_names[1]] = mag_spec
 
-            try:
-                infer_results = session.run(None, feeds)
-            except Exception as e_infer:
-                # Если на GPU закончилась память аллокатора ONNX, мягко переключаемся на CPU сессию
-                print(f"[Demucs Warning] Сбой GPU Arena ({e_infer}), переключение сегмента на CPU...")
-                unload_pipeline("demucs")
-                session = get_server_demucs_session(prefer_gpu=False)
-                infer_results = session.run(None, feeds)
+        infer_results = session.run(None, feeds)
 
-            time_data = None
-            freq_data = None
+        # Поиск временного выхода формы [1, 4, 2, 343980] или [4, 2, 343980]
+        time_data = None
+        freq_data = None
 
-            for res_idx, tensor in enumerate(infer_results):
-                shape = tensor.shape
-                if len(shape) == 4 and shape[1] == 4 and shape[2] == 2:
-                    time_data = tensor[0]
-                elif len(shape) == 3 and shape[0] == 4 and shape[1] == 2:
-                    time_data = tensor
-                elif (len(shape) == 5 and shape[1] == 4 and shape[2] == 4) or (len(shape) == 4 and shape[0] == 4 and shape[1] == 4):
-                    freq_data = tensor[0] if len(shape) == 5 else tensor
+        for res_idx, tensor in enumerate(infer_results):
+            shape = tensor.shape
+            # Временной домен: 4 трека, 2 канала, S сэмплов
+            if len(shape) == 4 and shape[1] == 4 and shape[2] == 2:
+                time_data = tensor[0] # [4, 2, S]
+            elif len(shape) == 3 and shape[0] == 4 and shape[1] == 2:
+                time_data = tensor
+            # Частотный домен: маска спектрограммы [1, 4, 4, B, F]
+            elif (len(shape) == 5 and shape[1] == 4 and shape[2] == 4) or (len(shape) == 4 and shape[0] == 4 and shape[1] == 4):
+                freq_data = tensor[0] if len(shape) == 5 else tensor
 
-            if time_data is None:
-                for tensor in infer_results:
-                    if tensor.ndim >= 3 and tensor.shape[-1] >= training_samples:
-                        time_data = tensor.reshape(4, 2, -1)
-                        break
+        if time_data is None:
+            # Если прямой time_data не найден, берём первый совместимый тензор
+            for tensor in infer_results:
+                if tensor.ndim >= 3 and tensor.shape[-1] >= training_samples:
+                    time_data = tensor.reshape(4, 2, -1)
+                    break
 
-            if time_data is None:
-                raise RuntimeError("Не удалось извлечь временные аудиосигналы из модели Demucs")
+        if time_data is None:
+            raise RuntimeError("Не удалось извлечь временные аудиосигналы из модели Demucs")
 
-            if freq_data is not None:
-                for t in range(4):
-                    try:
-                        spec_ch0 = torch.complex(torch.from_numpy(freq_data[t, 0]), torch.from_numpy(freq_data[t, 1]))
-                        spec_ch1 = torch.complex(torch.from_numpy(freq_data[t, 2]), torch.from_numpy(freq_data[t, 3]))
-
-                        full_spec_l = torch.zeros((2049, 340), dtype=torch.complex64)
-                        full_spec_r = torch.zeros((2049, 340), dtype=torch.complex64)
-                        full_spec_l[:2048, 2:338] = spec_ch0
-                        full_spec_r[:2048, 2:338] = spec_ch1
-
-                        istft_l = torch.istft(full_spec_l, fft_size, hop_length=hop_size, window=window_hann, length=training_samples) * np.sqrt(fft_size)
-                        istft_r = torch.istft(full_spec_r, fft_size, hop_length=hop_size, window=window_hann, length=training_samples) * np.sqrt(fft_size)
-
-                        time_data[t, 0] += istft_l.numpy()
-                        time_data[t, 1] += istft_r.numpy()
-                    except Exception:
-                        pass
-
-            window = np.ones(seg_len, dtype=np.float32)
-            if fade_len > 0:
-                fade_in = np.minimum(np.arange(seg_len) / fade_len, 1.0)
-                fade_out = np.minimum((seg_len - 1 - np.arange(seg_len)) / fade_len, 1.0)
-                window = np.minimum(fade_in, fade_out)
-
+        # Применяем iSTFT к частотной маске, если она присутствует
+        if freq_data is not None:
             for t in range(4):
-                outputs[t][:, start:end] += time_data[t, :, :seg_len] * window
-            weights[start:end] += window
+                try:
+                    # Частотная ветка Demucs (восстановление звука через istft)
+                    spec_ch0 = torch.complex(torch.from_numpy(freq_data[t, 0]), torch.from_numpy(freq_data[t, 1]))
+                    spec_ch1 = torch.complex(torch.from_numpy(freq_data[t, 2]), torch.from_numpy(freq_data[t, 3]))
 
-        weights = np.maximum(weights, 1e-8)
+                    full_spec_l = torch.zeros((2049, 340), dtype=torch.complex64)
+                    full_spec_r = torch.zeros((2049, 340), dtype=torch.complex64)
+                    full_spec_l[:2048, 2:338] = spec_ch0
+                    full_spec_r[:2048, 2:338] = spec_ch1
+
+                    istft_l = torch.istft(full_spec_l, fft_size, hop_length=hop_size, window=window_hann, length=training_samples) * np.sqrt(fft_size)
+                    istft_r = torch.istft(full_spec_r, fft_size, hop_length=hop_size, window=window_hann, length=training_samples) * np.sqrt(fft_size)
+
+                    time_data[t, 0] += istft_l.numpy()
+                    time_data[t, 1] += istft_r.numpy()
+                except Exception:
+                    pass
+
+        # Окно наложения
+        window = np.ones(seg_len, dtype=np.float32)
+        if fade_len > 0:
+            fade_in = np.minimum(np.arange(seg_len) / fade_len, 1.0)
+            fade_out = np.minimum((seg_len - 1 - np.arange(seg_len)) / fade_len, 1.0)
+            window = np.minimum(fade_in, fade_out)
+
         for t in range(4):
-            outputs[t] /= weights
+            outputs[t][:, start:end] += time_data[t, :, :seg_len] * window
+        weights[start:end] += window
 
-        result_files = {}
-        for idx, name in enumerate(tracks_names):
-            stem_path = output_dir / f"{name}.wav"
-            track_np = outputs[idx].T
-            sf.write(str(stem_path), track_np, 44100, subtype='PCM_16')
-            result_files[name] = f"/audio/stems/{output_dir.name}/{name}.wav"
+    weights = np.maximum(weights, 1e-8)
+    for t in range(4):
+        outputs[t] /= weights
 
-    finally:
-        # Принудительно выгружаем сессию Demucs и освобождаем VRAM
-        unload_pipeline("demucs")
+    result_files = {}
+    for idx, name in enumerate(tracks_names):
+        stem_path = output_dir / f"{name}.wav"
+        track_np = outputs[idx].T
+        sf.write(str(stem_path), track_np, 44100, subtype='PCM_16')
+        result_files[name] = f"/audio/stems/{output_dir.name}/{name}.wav"
 
     return result_files
 
@@ -1236,8 +1202,6 @@ def generation_worker():
                 save_history(history)
                 set_task_state(status="completed", progress_msg=f"Луп готов за {duration_sec} сек!")
 
-                unload_pipeline("stable_audio")
-
             else:
                 CURRENT_TASK_IS_FAST = task.get("fast_mode", True)
                 pipe = get_pipeline()
@@ -1282,7 +1246,9 @@ def generation_worker():
                     set_task_state(progress_msg=f"Символическое планирование (cot='{chosen_cot}')...")
                     gen_kwargs["cot"] = chosen_cot
 
-                force_cuda_cleanup()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
 
                 song = pipe(**gen_kwargs)
 
@@ -1366,7 +1332,9 @@ def generation_worker():
         finally:
             if pipe and LORA_STATE["parent_obj"] is not None:
                 remove_dual_loras(pipe)
-            force_cuda_cleanup()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
             task_queue.task_done()
 
 threading.Thread(target=generation_worker, daemon=True).start()
@@ -1387,12 +1355,14 @@ class StudioHandler(SimpleHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         req_path = parsed.path
 
+        # Поддержка обеих папок (demucs-web и demucs-web-collab)
         for prefix, folder_name in (("/demucs-web-collab", "demucs-web-collab"), ("/demucs-web", "demucs-web")):
             if req_path.startswith(prefix):
                 subpath = req_path.replace(prefix, "").lstrip("/")
                 if not subpath:
                     subpath = "index.html"
-
+                
+                # Ищем файл в указанной папке, а если её нет — во второй
                 target_file = (BASE_DIR / folder_name / subpath).resolve()
                 if not target_file.exists():
                     alt_folder = "demucs-web" if folder_name == "demucs-web-collab" else "demucs-web-collab"
@@ -1425,7 +1395,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
         if req_path in ["/", "/index.html"]:
             html_path = BASE_DIR / "index-collab.html"
             if not html_path.exists():
-                html_path = BASE_DIR / "index.html"
+                html_path = BASE_DIR / "index-collab.html"
             if html_path.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1436,6 +1406,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.send_error(404, "index.html not found")
             return
 
+        # Раздача стэмов
         if req_path.startswith("/audio/stems/"):
             rel_subpath = req_path.replace("/audio/stems/", "")
             parts = [p for p in rel_subpath.split("/") if p and p not in (".", "..")]
@@ -1659,15 +1630,18 @@ class StudioHandler(SimpleHTTPRequestHandler):
             target_path = None
             track_uid = str(int(time.time() * 1000))
 
+            # Извлекаем чистое имя файла из полного ngrok URL или относительного пути
             decoded_input = unquote(raw_input)
             fn_candidate = Path(urlparse(decoded_input).path).name if ("/" in decoded_input) else decoded_input
 
+            # Поиск в TRACKS_DIR
             if fn_candidate:
                 cand_file = TRACKS_DIR / fn_candidate
                 if cand_file.exists():
                     target_path = cand_file
                     track_uid = safe_track_id(cand_file.stem.replace("track_", "").replace("loop_", ""))
 
+            # Поиск по id (как треков, так и лупов)
             if not target_path:
                 cid = safe_track_id(raw_input)
                 for prefix in ("track_", "loop_"):
@@ -1682,7 +1656,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(json.dumps({
-                    "success": False,
+                    "success": False, 
                     "error": f"Аудиофайл не найден (запрошено: {fn_candidate or raw_input})"
                 }).encode("utf-8"))
                 return
@@ -1885,6 +1859,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             for p in presets:
                 if p["id"] == preset_id:
                     p["name"] = name
+                    p["style"] = style
                     p["style"] = style
                     existing = True
                     break
