@@ -19,6 +19,8 @@ MODELS_CACHE_DIR = BASE_DIR / "models_cache"
 MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 TRACKS_DIR = BASE_DIR / "outputs" / "web_tracks"
 TRACKS_DIR.mkdir(parents=True, exist_ok=True)
+STEMS_DIR = BASE_DIR / "outputs" / "stems"
+STEMS_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACTS_BASE_DIR = BASE_DIR / "outputs" / "artifacts"
 ARTIFACTS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = BASE_DIR / "uploads"
@@ -34,7 +36,6 @@ PERSONAS_FILE = BASE_DIR / "personas.json"
 os.environ["HF_HOME"] = str(MODELS_CACHE_DIR)
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-# Оптимизация памяти под 12 GB VRAM
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64,garbage_collection_threshold:0.7"
 os.environ["YUE_ENABLE_FLASH_ATTN"] = "0"
 os.environ["YUE_DISABLE_CUDA_GRAPH"] = "1"
@@ -147,6 +148,7 @@ except Exception:
 import torch
 import torchaudio
 import soundfile as sf
+import numpy as np
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -254,7 +256,6 @@ class SafeNARModelWrapper:
     def __call__(self, *args, **kwargs):
         return self._raw_model(*args, **kwargs)
 
-# Для 12GB VRAM уменьшаем query_chunk_size до 256
 ORIG_CACHED_NAR_INIT = yue_nar.CachedNAR.__init__
 
 def patched_cached_nar_init(self, *args, **kwargs):
@@ -269,7 +270,7 @@ def patched_cached_nar_init(self, *args, **kwargs):
     try:
         sig = inspect.signature(ORIG_CACHED_NAR_INIT)
         param_names = list(sig.parameters.keys())
-        chunk_val = 256  # 256 оптимально для 12 GB
+        chunk_val = 256
         if "query_chunk_size" in param_names:
             pos = param_names.index("query_chunk_size")
             arg_idx = pos - 1 if (param_names and param_names[0] == "self") else pos
@@ -340,7 +341,7 @@ def safe_fast_generate_tokens(model, prefix, sampling=None, seed=42, phase=None,
     effective_sampling = sampling
 
     if CURRENT_TASK_IS_FAST and (phase == "song" or phase is None):
-        max_limit = 2800  # Снижаем предел для 12GB
+        max_limit = 2800
         if effective_sampling is not None:
             if dataclasses.is_dataclass(effective_sampling):
                 changes = {}
@@ -511,6 +512,134 @@ def get_stable_audio_pipeline():
 
         GLOBAL_STABLE_AUDIO_PIPE = GLOBAL_STABLE_AUDIO_PIPE.to(device)
     return GLOBAL_STABLE_AUDIO_PIPE
+
+# =====================================================================
+# Серверный экстрактор стэмов Demucs на GPU
+# =====================================================================
+DEMUCS_SESSION = None
+
+def get_server_demucs_session():
+    global DEMUCS_SESSION
+    if DEMUCS_SESSION is None:
+        import onnxruntime as ort
+        model_path = BASE_DIR / "demucs-web-collab" / "htdemucs_embedded.onnx"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Файл ONNX модели Demucs не найден по пути: {model_path}")
+        
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
+        sess_opt = ort.SessionOptions()
+        sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        DEMUCS_SESSION = ort.InferenceSession(str(model_path), sess_opt, providers=providers)
+    return DEMUCS_SESSION
+
+def run_server_demucs_separation(audio_path: Path, output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 1. Загрузка и ресемплинг в 44.1 kHz
+    wav, sr = torchaudio.load(str(audio_path))
+    if sr != 44100:
+        resampler = torchaudio.transforms.Resample(sr, 44100)
+        wav = resampler(wav)
+        sr = 44100
+        
+    if wav.shape[0] == 1:
+        wav = wav.repeat(2, 1)
+    elif wav.shape[0] > 2:
+        wav = wav[:2, :]
+        
+    left_ch = wav[0].numpy()
+    right_ch = wav[1].numpy()
+    total_samples = len(left_ch)
+    
+    # Константы модели HTDemucs
+    training_samples = 343980
+    hop_size = 1024
+    fft_size = 4096
+    segment_overlap = 0.25
+    tracks_names = ['drums', 'bass', 'other', 'vocals']
+    
+    stride = int(training_samples * (1 - segment_overlap))
+    num_segments = int(np.ceil((total_samples - training_samples) / stride)) + 1
+    
+    outputs = [np.zeros((2, total_samples), dtype=np.float32) for _ in range(4)]
+    weights = np.zeros(total_samples, dtype=np.float32)
+    
+    session = get_server_demucs_session()
+    input_names = [inp.name for inp in session.get_inputs()]
+    
+    # Окно сглаживания сегментов
+    fade_len = int(stride * 0.5)
+    
+    for start in range(0, total_samples, stride):
+        end = min(start + training_samples, total_samples)
+        seg_len = end - start
+        
+        seg_l = np.zeros(training_samples, dtype=np.float32)
+        seg_r = np.zeros(training_samples, dtype=np.float32)
+        seg_l[:seg_len] = left_ch[start:end]
+        seg_r[:seg_len] = right_ch[start:end]
+        
+        # Waveform вход [1, 2, S]
+        waveform_in = np.stack([seg_l, seg_r], axis=0)[np.newaxis, ...]
+        feeds = {input_names[0]: waveform_in}
+        
+        # Если модель требует спектрограмму в качестве второго входа
+        if len(input_names) > 1:
+            pad_val = int(hop_size // 2 * 3)
+            le = int(np.ceil(training_samples / hop_size))
+            pad_right = pad_val + le * hop_size - training_samples
+            
+            p_l = np.pad(seg_l, (pad_val, pad_right), mode='reflect')
+            p_r = np.pad(seg_r, (pad_val, pad_right), mode='reflect')
+            center_pad = fft_size // 2
+            p_l = np.pad(p_l, (center_pad, center_pad), mode='reflect')
+            p_r = np.pad(p_r, (center_pad, center_pad), mode='reflect')
+            
+            w = torch.hann_window(fft_size)
+            tl = torch.from_numpy(p_l)
+            tr = torch.from_numpy(p_r)
+            
+            stft_l = torch.stft(tl, fft_size, hop_length=hop_size, window=w, return_complex=True)
+            stft_r = torch.stft(tr, fft_size, hop_length=hop_size, window=w, return_complex=True)
+            scale = 1.0 / np.sqrt(fft_size)
+            
+            spec_l = stft_l[:, 2:2+336] * scale
+            spec_r = stft_r[:, 2:2+336] * scale
+            
+            mag_spec = np.zeros((1, 4, 2048, 336), dtype=np.float32)
+            mag_spec[0, 0] = spec_l.real[:2048, :336].numpy()
+            mag_spec[0, 1] = spec_l.imag[:2048, :336].numpy()
+            mag_spec[0, 2] = spec_r.real[:2048, :336].numpy()
+            mag_spec[0, 3] = spec_r.imag[:2048, :336].numpy()
+            feeds[input_names[1]] = mag_spec
+            
+        infer_out = session.run(None, feeds)
+        out_audio = infer_out[0][0] # [4, 2, S]
+        
+        # Окно наложения
+        window = np.ones(seg_len, dtype=np.float32)
+        if fade_len > 0:
+            fade_in = np.minimum(np.arange(seg_len) / fade_len, 1.0)
+            fade_out = np.minimum((seg_len - 1 - np.arange(seg_len)) / fade_len, 1.0)
+            window = np.minimum(fade_in, fade_out)
+            
+        for t in range(4):
+            outputs[t][:, start:end] += out_audio[t, :, :seg_len] * window
+        weights[start:end] += window
+        
+    # Нормализация на вес перекрытия
+    weights = np.maximum(weights, 1e-8)
+    for t in range(4):
+        outputs[t] /= weights
+        
+    result_files = {}
+    for idx, name in enumerate(tracks_names):
+        stem_path = output_dir / f"{name}.wav"
+        track_np = outputs[idx].T # [samples, 2]
+        sf.write(str(stem_path), track_np, 44100, subtype='PCM_16')
+        result_files[name] = f"/audio/stems/{output_dir.name}/{name}.wav"
+        
+    return result_files
 
 LORA_STATE = {
     "parent_obj": None,
@@ -1156,13 +1285,13 @@ class StudioHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        if parsed.path.startswith("/demucs-web"):
-            subpath = parsed.path.replace("/demucs-web", "").lstrip("/")
+        if parsed.path.startswith("/demucs-web-collab"):
+            subpath = parsed.path.replace("/demucs-web-collab", "").lstrip("/")
             if not subpath:
                 subpath = "index.html"
-            target_file = (BASE_DIR / "demucs-web" / subpath).resolve()
+            target_file = (BASE_DIR / "demucs-web-collab" / subpath).resolve()
 
-            if not target_file.is_relative_to((BASE_DIR / "demucs-web").resolve()):
+            if not target_file.is_relative_to((BASE_DIR / "demucs-web-collab").resolve()):
                 self.send_error(403, "Forbidden")
                 return
 
@@ -1200,6 +1329,25 @@ class StudioHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(f.read())
                 return
             self.send_error(404, "index.html not found")
+            return
+
+        # Раздача стэмов
+        if parsed.path.startswith("/audio/stems/"):
+            rel_subpath = parsed.path.replace("/audio/stems/", "")
+            parts = [p for p in rel_subpath.split("/") if p and p not in (".", "..")]
+            if len(parts) >= 2:
+                folder_id = safe_track_id(parts[0])
+                file_name = Path(parts[1]).name
+                stem_file = STEMS_DIR / folder_id / file_name
+                if stem_file.exists() and stem_file.is_file():
+                    self.send_response(200)
+                    self.send_header("Content-Type", "audio/wav")
+                    self.send_header("Content-Length", str(stem_file.stat().st_size))
+                    self.end_headers()
+                    with open(stem_file, "rb") as f:
+                        self.wfile.write(f.read())
+                    return
+            self.send_error(404, "Stem not found")
             return
 
         if parsed.path.startswith("/audio/"):
@@ -1394,6 +1542,60 @@ class StudioHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         content_length = int(self.headers.get("Content-Length", 0))
 
+        # API: Разделение стэмов на сервере через GPU Demucs
+        if parsed.path == "/api/demucs/separate":
+            post_data = self.rfile.read(content_length)
+            try:
+                data = json.loads(post_data.decode("utf-8"))
+            except Exception:
+                data = {}
+
+            target_input = data.get("audio_url") or data.get("track_id") or ""
+            target_path = None
+            track_uid = str(int(time.time() * 1000))
+
+            if target_input.startswith("/audio/"):
+                raw_fn = target_input.replace("/audio/", "")
+                cand = safe_resolve(TRACKS_DIR, raw_fn)
+                if cand.exists():
+                    target_path = cand
+                    track_uid = safe_track_id(Path(raw_fn).stem.replace("track_", ""))
+            else:
+                clean_tid = safe_track_id(target_input)
+                cand = TRACKS_DIR / f"track_{clean_tid}.flac"
+                if cand.exists():
+                    target_path = cand
+                    track_uid = clean_tid
+
+            if not target_path or not target_path.exists():
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": "Аудиофайл не найден"}).encode("utf-8"))
+                return
+
+            try:
+                # Освобождаем память перед запуском Demucs на GPU
+                unload_pipeline("all")
+                target_stem_dir = STEMS_DIR / track_uid
+                stems_urls = run_server_demucs_separation(target_path, target_stem_dir)
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "success": True,
+                    "track_id": track_uid,
+                    "stems": stems_urls
+                }).encode("utf-8"))
+            except Exception as ex:
+                traceback.print_exc()
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(ex)}).encode("utf-8"))
+            return
+
         if parsed.path == "/api/upload":
             content_type = self.headers.get("Content-Type", "")
             raw_data = self.rfile.read(content_length)
@@ -1480,6 +1682,12 @@ class StudioHandler(SimpleHTTPRequestHandler):
                         art_dir = safe_resolve(ARTIFACTS_BASE_DIR, clean_id)
                         if art_dir.exists():
                             shutil.rmtree(art_dir)
+                    except Exception:
+                        pass
+                    try:
+                        st_dir = safe_resolve(STEMS_DIR, clean_id)
+                        if st_dir.exists():
+                            shutil.rmtree(st_dir)
                     except Exception:
                         pass
                 history = [t for t in history if t["id"] != raw_id]
@@ -1658,6 +1866,7 @@ def run_server(port=7860):
     server = HTTPServer(("0.0.0.0", port), StudioHandler)
     print("=" * 65)
     print(f" YuE2-3B Studio Server запущен на бэкенде: {device.upper()} (Colab Optimized)")
+    print(f" Серверный Demucs GPU API: активен (/api/demucs/separate)")
     print(f" Порт: {port}")
     print("=" * 65)
     server.serve_forever()

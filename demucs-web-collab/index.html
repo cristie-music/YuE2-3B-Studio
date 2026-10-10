@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YuE2 Studio - Разделение стэмов (Demucs)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            suno: {
+              DEFAULT: '#09090b',
+              sidebar: '#000000',
+              panel: '#121214',
+              card: '#18181b',
+              border: '#27272a'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #52525b; }
+  </style>
+</head>
+<body class="bg-suno text-white min-h-screen select-none">
+
+  <div class="max-w-4xl mx-auto px-4 py-8 space-y-6">
+    
+    <!-- Шапка -->
+    <div class="flex items-center justify-between border-b border-white/5 pb-4">
+      <div class="flex items-center gap-3">
+        <div class="w-10 h-10 rounded-full bg-gradient-to-br from-pink-500 to-purple-600 flex items-center justify-center font-bold text-lg shadow-lg">
+          ✂
+        </div>
+        <div>
+          <h1 class="text-lg font-bold">Экстрактор стэмов (Demucs AI)</h1>
+          <p class="text-xs text-zinc-500">Автономное разделение трека на Вокал, Ударные, Бас и Инструментал</p>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="cacheBadge" class="hidden px-2.5 py-0.5 rounded-full text-xs font-mono bg-blue-500/20 text-blue-300 border border-blue-500/30">Кэш: проверка...</span>
+        <span id="backendBadge" class="px-2.5 py-0.5 rounded-full text-xs font-mono bg-white/5 text-zinc-400 border border-white/10">Определение GPU...</span>
+      </div>
+    </div>
+
+    <!-- Область загрузки / Файла -->
+    <div id="dropZone" class="bg-suno-panel border-2 border-dashed border-white/10 hover:border-pink-500/50 rounded-2xl p-6 text-center cursor-pointer transition-all">
+      <div class="text-3xl mb-2">🎵</div>
+      <div class="text-sm font-semibold text-zinc-200">Перетащите аудиофайл сюда или нажмите для выбора</div>
+      <div class="text-xs text-zinc-500 mt-1">Поддерживаются FLAC, WAV, MP3, OGG</div>
+      <div id="audioFileName" class="mt-3 text-xs font-mono text-pink-400 font-semibold truncate max-w-md mx-auto"></div>
+      <input type="file" id="fileInput" accept="audio/*" class="hidden">
+    </div>
+
+    <!-- Панель статуса и прогресса -->
+    <div class="bg-suno-card rounded-2xl border border-white/5 p-5 space-y-4 shadow-xl">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <div class="w-2 h-2 rounded-full bg-pink-500 animate-pulse"></div>
+          <span class="text-xs font-bold text-zinc-400 uppercase tracking-wider">Процесс разделения</span>
+        </div>
+        <button id="processBtn" disabled class="px-5 py-2 rounded-xl text-xs font-bold bg-gradient-to-r from-orange-500 to-pink-600 hover:brightness-110 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-md">
+          Разделить стэмы
+        </button>
+      </div>
+
+      <div class="w-full bg-zinc-900 h-2 rounded-full overflow-hidden border border-white/5">
+        <div id="progressFill" class="h-full bg-gradient-to-r from-pink-500 to-purple-600 w-0 transition-all duration-300"></div>
+      </div>
+
+      <div id="status" class="text-xs text-zinc-400 font-mono">Ожидание инициализации...</div>
+
+      <!-- Статистика -->
+      <div id="statsRow" class="hidden grid grid-cols-4 gap-3 pt-3 border-t border-white/5 text-center font-mono text-xs">
+        <div class="bg-zinc-900/50 p-2 rounded-xl border border-white/5">
+          <div class="text-zinc-500 text-[10px]">ВРЕМЯ</div>
+          <div id="statElapsed" class="text-pink-400 font-bold mt-0.5">0:00</div>
+        </div>
+        <div class="bg-zinc-900/50 p-2 rounded-xl border border-white/5">
+          <div class="text-zinc-500 text-[10px]">СЕГМЕНТ</div>
+          <div id="statSegment" class="text-purple-400 font-bold mt-0.5">0/0</div>
+        </div>
+        <div class="bg-zinc-900/50 p-2 rounded-xl border border-white/5">
+          <div class="text-zinc-500 text-[10px]">СКОРОСТЬ</div>
+          <div id="statSpeed" class="text-blue-400 font-bold mt-0.5">-</div>
+        </div>
+        <div class="bg-zinc-900/50 p-2 rounded-xl border border-white/5">
+          <div class="text-zinc-500 text-[10px]">ОСТАЛОСЬ</div>
+          <div id="statETA" class="text-green-400 font-bold mt-0.5">--:--</div>
+        </div>
+      </div>
+
+      <!-- Консоль логов -->
+      <div id="statusDetail" class="hidden p-3 rounded-xl bg-black/40 border border-white/5 max-h-32 overflow-y-auto space-y-0.5"></div>
+    </div>
+
+    <!-- Результаты: 4 дорожки -->
+    <div id="results" class="hidden space-y-3">
+      <div class="flex items-center justify-between px-1">
+        <div>
+          <h2 class="text-sm font-bold text-white">Выделенные дорожки</h2>
+          <p class="text-[11px] text-zinc-500">Индивидуальные дорожки 44.1kHz в несжатом формате WAV</p>
+        </div>
+        <button onclick="downloadAllStems()" class="px-4 py-2 rounded-xl text-xs font-bold bg-pink-600 hover:bg-pink-500 transition-colors flex items-center gap-1.5 shadow-lg">
+          <span>↓</span> Скачать все стэмы (ZIP/WAV)
+        </button>
+      </div>
+
+      <div id="trackList" class="space-y-2.5"></div>
+    </div>
+
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
