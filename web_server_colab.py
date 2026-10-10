@@ -12,7 +12,7 @@ import traceback
 import dataclasses
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_CACHE_DIR = BASE_DIR / "models_cache"
@@ -522,10 +522,13 @@ def get_server_demucs_session():
     global DEMUCS_SESSION
     if DEMUCS_SESSION is None:
         import onnxruntime as ort
-        model_path = BASE_DIR / "demucs-web-collab" / "htdemucs_embedded.onnx"
+        # Ищем модель в demucs-web или demucs-web-collab
+        model_path = BASE_DIR / "demucs-web" / "htdemucs_embedded.onnx"
         if not model_path.exists():
-            raise FileNotFoundError(f"Файл ONNX модели Demucs не найден по пути: {model_path}")
-        
+            model_path = BASE_DIR / "demucs-web-collab" / "htdemucs_embedded.onnx"
+        if not model_path.exists():
+            raise FileNotFoundError(f"Файл ONNX модели Demucs не найден в папках demucs-web/demucs-web-collab")
+
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
         sess_opt = ort.SessionOptions()
         sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -534,111 +537,101 @@ def get_server_demucs_session():
 
 def run_server_demucs_separation(audio_path: Path, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Загрузка и ресемплинг в 44.1 kHz
+
     wav, sr = torchaudio.load(str(audio_path))
     if sr != 44100:
         resampler = torchaudio.transforms.Resample(sr, 44100)
         wav = resampler(wav)
         sr = 44100
-        
+
     if wav.shape[0] == 1:
         wav = wav.repeat(2, 1)
     elif wav.shape[0] > 2:
         wav = wav[:2, :]
-        
+
     left_ch = wav[0].numpy()
     right_ch = wav[1].numpy()
     total_samples = len(left_ch)
-    
-    # Константы модели HTDemucs
+
     training_samples = 343980
     hop_size = 1024
     fft_size = 4096
     segment_overlap = 0.25
     tracks_names = ['drums', 'bass', 'other', 'vocals']
-    
+
     stride = int(training_samples * (1 - segment_overlap))
-    num_segments = int(np.ceil((total_samples - training_samples) / stride)) + 1
-    
     outputs = [np.zeros((2, total_samples), dtype=np.float32) for _ in range(4)]
     weights = np.zeros(total_samples, dtype=np.float32)
-    
+
     session = get_server_demucs_session()
     input_names = [inp.name for inp in session.get_inputs()]
-    
-    # Окно сглаживания сегментов
     fade_len = int(stride * 0.5)
-    
+
     for start in range(0, total_samples, stride):
         end = min(start + training_samples, total_samples)
         seg_len = end - start
-        
+
         seg_l = np.zeros(training_samples, dtype=np.float32)
         seg_r = np.zeros(training_samples, dtype=np.float32)
         seg_l[:seg_len] = left_ch[start:end]
         seg_r[:seg_len] = right_ch[start:end]
-        
-        # Waveform вход [1, 2, S]
+
         waveform_in = np.stack([seg_l, seg_r], axis=0)[np.newaxis, ...]
         feeds = {input_names[0]: waveform_in}
-        
-        # Если модель требует спектрограмму в качестве второго входа
+
         if len(input_names) > 1:
             pad_val = int(hop_size // 2 * 3)
             le = int(np.ceil(training_samples / hop_size))
             pad_right = pad_val + le * hop_size - training_samples
-            
+
             p_l = np.pad(seg_l, (pad_val, pad_right), mode='reflect')
             p_r = np.pad(seg_r, (pad_val, pad_right), mode='reflect')
             center_pad = fft_size // 2
             p_l = np.pad(p_l, (center_pad, center_pad), mode='reflect')
             p_r = np.pad(p_r, (center_pad, center_pad), mode='reflect')
-            
+
             w = torch.hann_window(fft_size)
             tl = torch.from_numpy(p_l)
             tr = torch.from_numpy(p_r)
-            
+
             stft_l = torch.stft(tl, fft_size, hop_length=hop_size, window=w, return_complex=True)
             stft_r = torch.stft(tr, fft_size, hop_length=hop_size, window=w, return_complex=True)
             scale = 1.0 / np.sqrt(fft_size)
-            
+
             spec_l = stft_l[:, 2:2+336] * scale
             spec_r = stft_r[:, 2:2+336] * scale
-            
+
             mag_spec = np.zeros((1, 4, 2048, 336), dtype=np.float32)
             mag_spec[0, 0] = spec_l.real[:2048, :336].numpy()
             mag_spec[0, 1] = spec_l.imag[:2048, :336].numpy()
             mag_spec[0, 2] = spec_r.real[:2048, :336].numpy()
             mag_spec[0, 3] = spec_r.imag[:2048, :336].numpy()
             feeds[input_names[1]] = mag_spec
-            
+
         infer_out = session.run(None, feeds)
-        out_audio = infer_out[0][0] # [4, 2, S]
-        
-        # Окно наложения
+        out_audio = infer_out[0][0]
+
         window = np.ones(seg_len, dtype=np.float32)
         if fade_len > 0:
             fade_in = np.minimum(np.arange(seg_len) / fade_len, 1.0)
             fade_out = np.minimum((seg_len - 1 - np.arange(seg_len)) / fade_len, 1.0)
             window = np.minimum(fade_in, fade_out)
-            
+
         for t in range(4):
             outputs[t][:, start:end] += out_audio[t, :, :seg_len] * window
         weights[start:end] += window
-        
-    # Нормализация на вес перекрытия
+
     weights = np.maximum(weights, 1e-8)
     for t in range(4):
         outputs[t] /= weights
-        
+
     result_files = {}
     for idx, name in enumerate(tracks_names):
         stem_path = output_dir / f"{name}.wav"
-        track_np = outputs[idx].T # [samples, 2]
+        track_np = outputs[idx].T
         sf.write(str(stem_path), track_np, 44100, subtype='PCM_16')
         result_files[name] = f"/audio/stems/{output_dir.name}/{name}.wav"
-        
+
     return result_files
 
 LORA_STATE = {
@@ -1284,43 +1277,49 @@ class StudioHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
+        req_path = parsed.path
 
-        if parsed.path.startswith("/demucs-web-collab"):
-            subpath = parsed.path.replace("/demucs-web-collab", "").lstrip("/")
-            if not subpath:
-                subpath = "index.html"
-            target_file = (BASE_DIR / "demucs-web-collab" / subpath).resolve()
+        # Поддержка обеих папок (demucs-web и demucs-web-collab)
+        for prefix, folder_name in (("/demucs-web-collab", "demucs-web-collab"), ("/demucs-web", "demucs-web")):
+            if req_path.startswith(prefix):
+                subpath = req_path.replace(prefix, "").lstrip("/")
+                if not subpath:
+                    subpath = "index.html"
+                
+                # Ищем файл в указанной папке, а если её нет — во второй
+                target_file = (BASE_DIR / folder_name / subpath).resolve()
+                if not target_file.exists():
+                    alt_folder = "demucs-web" if folder_name == "demucs-web-collab" else "demucs-web-collab"
+                    target_file = (BASE_DIR / alt_folder / subpath).resolve()
 
-            if not target_file.is_relative_to((BASE_DIR / "demucs-web-collab").resolve()):
-                self.send_error(403, "Forbidden")
+                if not target_file.exists() or not target_file.is_file():
+                    self.send_error(404, "File not found")
+                    return
+
+                ext = target_file.suffix.lower()
+                mime_map = {
+                    ".html": "text/html; charset=utf-8",
+                    ".js": "application/javascript; charset=utf-8",
+                    ".mjs": "application/javascript; charset=utf-8",
+                    ".json": "application/json; charset=utf-8",
+                    ".css": "text/css; charset=utf-8",
+                    ".wasm": "application/wasm",
+                    ".onnx": "application/octet-stream"
+                }
+                content_type = mime_map.get(ext, "application/octet-stream")
+
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(target_file.stat().st_size))
+                self.end_headers()
+                with open(target_file, "rb") as f:
+                    self.wfile.write(f.read())
                 return
 
-            if not target_file.exists() or not target_file.is_file():
-                self.send_error(404, "File not found")
-                return
-
-            ext = target_file.suffix.lower()
-            mime_map = {
-                ".html": "text/html; charset=utf-8",
-                ".js": "application/javascript; charset=utf-8",
-                ".mjs": "application/javascript; charset=utf-8",
-                ".json": "application/json; charset=utf-8",
-                ".css": "text/css; charset=utf-8",
-                ".wasm": "application/wasm",
-                ".onnx": "application/octet-stream"
-            }
-            content_type = mime_map.get(ext, "application/octet-stream")
-
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(target_file.stat().st_size))
-            self.end_headers()
-            with open(target_file, "rb") as f:
-                self.wfile.write(f.read())
-            return
-
-        if parsed.path in ["/", "/index.html"]:
-            html_path = BASE_DIR / "index.html"
+        if req_path in ["/", "/index.html"]:
+            html_path = BASE_DIR / "index-collab.html"
+            if not html_path.exists():
+                html_path = BASE_DIR / "index-collab.html"
             if html_path.exists():
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1332,8 +1331,8 @@ class StudioHandler(SimpleHTTPRequestHandler):
             return
 
         # Раздача стэмов
-        if parsed.path.startswith("/audio/stems/"):
-            rel_subpath = parsed.path.replace("/audio/stems/", "")
+        if req_path.startswith("/audio/stems/"):
+            rel_subpath = req_path.replace("/audio/stems/", "")
             parts = [p for p in rel_subpath.split("/") if p and p not in (".", "..")]
             if len(parts) >= 2:
                 folder_id = safe_track_id(parts[0])
@@ -1350,8 +1349,8 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.send_error(404, "Stem not found")
             return
 
-        if parsed.path.startswith("/audio/"):
-            raw_filename = parsed.path.replace("/audio/", "")
+        if req_path.startswith("/audio/"):
+            raw_filename = req_path.replace("/audio/", "")
             try:
                 file_path = safe_resolve(TRACKS_DIR, raw_filename)
             except PermissionError:
@@ -1402,7 +1401,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(f.read())
             return
 
-        if parsed.path == "/api/score":
+        if req_path == "/api/score":
             raw_id = qs.get("id", [""])[0]
             clean_id = safe_track_id(raw_id)
             try:
@@ -1437,7 +1436,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True, "abc": abc_content}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/midi":
+        if req_path == "/api/midi":
             raw_id = qs.get("id", [""])[0]
             clean_id = safe_track_id(raw_id)
             try:
@@ -1491,14 +1490,14 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(midi_bytes)
             return
 
-        if parsed.path == "/api/loras":
+        if req_path == "/api/loras":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(list_available_loras()).encode("utf-8"))
             return
 
-        if parsed.path == "/api/status":
+        if req_path == "/api/status":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -1508,28 +1507,28 @@ class StudioHandler(SimpleHTTPRequestHandler):
             }).encode("utf-8"))
             return
 
-        if parsed.path == "/api/history":
+        if req_path == "/api/history":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(load_history()).encode("utf-8"))
             return
 
-        if parsed.path == "/api/presets":
+        if req_path == "/api/presets":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(load_presets()).encode("utf-8"))
             return
 
-        if parsed.path == "/api/personas":
+        if req_path == "/api/personas":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
             self.wfile.write(json.dumps(load_personas()).encode("utf-8"))
             return
 
-        if parsed.path == "/api/profile":
+        if req_path == "/api/profile":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -1541,41 +1540,52 @@ class StudioHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         content_length = int(self.headers.get("Content-Length", 0))
+        req_path = parsed.path.rstrip("/")
 
-        # API: Разделение стэмов на сервере через GPU Demucs
-        if parsed.path == "/api/demucs/separate":
+        # API: Разделение стэмов на GPU
+        if req_path == "/api/demucs/separate":
             post_data = self.rfile.read(content_length)
             try:
                 data = json.loads(post_data.decode("utf-8"))
             except Exception:
                 data = {}
 
-            target_input = data.get("audio_url") or data.get("track_id") or ""
+            raw_input = data.get("audio_url") or data.get("track_id") or ""
             target_path = None
             track_uid = str(int(time.time() * 1000))
 
-            if target_input.startswith("/audio/"):
-                raw_fn = target_input.replace("/audio/", "")
-                cand = safe_resolve(TRACKS_DIR, raw_fn)
-                if cand.exists():
-                    target_path = cand
-                    track_uid = safe_track_id(Path(raw_fn).stem.replace("track_", ""))
-            else:
-                clean_tid = safe_track_id(target_input)
-                cand = TRACKS_DIR / f"track_{clean_tid}.flac"
-                if cand.exists():
-                    target_path = cand
-                    track_uid = clean_tid
+            # Извлекаем чистое имя файла из полного ngrok URL или относительного пути
+            decoded_input = unquote(raw_input)
+            fn_candidate = Path(urlparse(decoded_input).path).name if ("/" in decoded_input) else decoded_input
+
+            # Поиск в TRACKS_DIR
+            if fn_candidate:
+                cand_file = TRACKS_DIR / fn_candidate
+                if cand_file.exists():
+                    target_path = cand_file
+                    track_uid = safe_track_id(cand_file.stem.replace("track_", "").replace("loop_", ""))
+
+            # Поиск по id (как треков, так и лупов)
+            if not target_path:
+                cid = safe_track_id(raw_input)
+                for prefix in ("track_", "loop_"):
+                    cand_file = TRACKS_DIR / f"{prefix}{cid}.flac"
+                    if cand_file.exists():
+                        target_path = cand_file
+                        track_uid = cid
+                        break
 
             if not target_path or not target_path.exists():
                 self.send_response(404)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": False, "error": "Аудиофайл не найден"}).encode("utf-8"))
+                self.wfile.write(json.dumps({
+                    "success": False, 
+                    "error": f"Аудиофайл не найден (запрошено: {fn_candidate or raw_input})"
+                }).encode("utf-8"))
                 return
 
             try:
-                # Освобождаем память перед запуском Demucs на GPU
                 unload_pipeline("all")
                 target_stem_dir = STEMS_DIR / track_uid
                 stems_urls = run_server_demucs_separation(target_path, target_stem_dir)
@@ -1596,7 +1606,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"success": False, "error": str(ex)}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/upload":
+        if req_path == "/api/upload":
             content_type = self.headers.get("Content-Type", "")
             raw_data = self.rfile.read(content_length)
 
@@ -1663,7 +1673,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
         except Exception:
             data = {}
 
-        if parsed.path == "/api/tracks/delete":
+        if req_path == "/api/tracks/delete":
             raw_id = data.get("id", "")
             clean_id = safe_track_id(raw_id)
             history = load_history()
@@ -1699,7 +1709,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/loras/delete":
+        if req_path == "/api/loras/delete":
             lora_fn = data.get("filename", "")
             try:
                 target_path = safe_resolve(LORAS_DIR, lora_fn)
@@ -1719,7 +1729,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True, "loras": list_available_loras()}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/personas":
+        if req_path == "/api/personas":
             persona_id = data.get("id") or f"pers_{int(time.time() * 1000)}"
             name = data.get("name", "New Voice Persona").strip()
             style = data.get("style", "").strip()
@@ -1753,7 +1763,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True, "personas": personas}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/personas/delete":
+        if req_path == "/api/personas/delete":
             persona_id = data.get("id")
             personas = [p for p in load_personas() if p["id"] != persona_id]
             save_personas(personas)
@@ -1763,7 +1773,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True, "personas": personas}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/presets":
+        if req_path == "/api/presets":
             preset_id = data.get("id") or f"p_{int(time.time() * 1000)}"
             name = data.get("name", "Новый пресет").strip()
             style = data.get("style", "").strip()
@@ -1773,6 +1783,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             for p in presets:
                 if p["id"] == preset_id:
                     p["name"] = name
+                    p["style"] = style
                     p["style"] = style
                     existing = True
                     break
@@ -1787,7 +1798,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True, "presets": presets}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/presets/delete":
+        if req_path == "/api/presets/delete":
             preset_id = data.get("id")
             presets = [p for p in load_presets() if p["id"] != preset_id]
             save_presets(presets)
@@ -1797,7 +1808,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True, "presets": presets}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/rate":
+        if req_path == "/api/rate":
             track_id = data.get("id")
             rating = int(data.get("rating", 0))
             history = load_history()
@@ -1813,7 +1824,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/generate":
+        if req_path == "/api/generate":
             task_id = str(int(time.time() * 1000))
             raw_audio = data.get("audio_file")
             clean_audio = Path(raw_audio).name if raw_audio else None
@@ -1848,7 +1859,7 @@ class StudioHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"success": True, "task_id": task_id}).encode("utf-8"))
             return
 
-        if parsed.path == "/api/profile":
+        if req_path == "/api/profile":
             new_name = data.get("name", "cristie").strip()
             avatar = new_name[0].upper() if new_name else "C"
             updated = {"name": new_name, "avatar_letter": avatar}
