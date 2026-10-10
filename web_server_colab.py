@@ -516,6 +516,9 @@ def get_stable_audio_pipeline():
 # =====================================================================
 # Серверный экстрактор стэмов Demucs на GPU
 # =====================================================================
+# =====================================================================
+# Серверный экстрактор стэмов Demucs
+# =====================================================================
 DEMUCS_SESSION = None
 
 def get_server_demucs_session():
@@ -523,13 +526,11 @@ def get_server_demucs_session():
     if DEMUCS_SESSION is None:
         import onnxruntime as ort
         import urllib.request
-        
-        # 1. Проверяем локальные папки репозитория
+
         model_path = BASE_DIR / "demucs-web" / "htdemucs_embedded.onnx"
         if not model_path.exists():
             model_path = BASE_DIR / "demucs-web-collab" / "htdemucs_embedded.onnx"
-            
-        # 2. Если файл отсутствует — скачиваем веса в кэш моделей
+
         if not model_path.exists():
             cache_model_path = MODELS_CACHE_DIR / "htdemucs_embedded.onnx"
             if not cache_model_path.exists():
@@ -539,10 +540,27 @@ def get_server_demucs_session():
                 print("[Demucs GPU] Модель успешно загружена!")
             model_path = cache_model_path
 
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
         sess_opt = ort.SessionOptions()
         sess_opt.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        DEMUCS_SESSION = ort.InferenceSession(str(model_path), sess_opt, providers=providers)
+        
+        # Отключаем сбойные эвристики cuDNN v9 для стабильности на T4 GPU
+        cuda_options = {
+            "device_id": 0,
+            "arena_extend_strategy": "kNextPowerOfTwo",
+            "gpu_mem_limit": 4 * 1024 * 1024 * 1024,
+            "cudnn_conv_algo_search": "DEFAULT"
+        }
+        
+        providers = [
+            ("CUDAExecutionProvider", cuda_options),
+            "CPUExecutionProvider"
+        ] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+
+        try:
+            DEMUCS_SESSION = ort.InferenceSession(str(model_path), sess_opt, providers=providers)
+        except Exception:
+            DEMUCS_SESSION = ort.InferenceSession(str(model_path), sess_opt, providers=["CPUExecutionProvider"])
+
     return DEMUCS_SESSION
 
 def run_server_demucs_separation(audio_path: Path, output_dir: Path):
@@ -575,7 +593,10 @@ def run_server_demucs_separation(audio_path: Path, output_dir: Path):
 
     session = get_server_demucs_session()
     input_names = [inp.name for inp in session.get_inputs()]
+    output_names = [out.name for out in session.get_outputs()]
     fade_len = int(stride * 0.5)
+
+    window_hann = torch.hann_window(fft_size)
 
     for start in range(0, total_samples, stride):
         end = min(start + training_samples, total_samples)
@@ -600,12 +621,11 @@ def run_server_demucs_separation(audio_path: Path, output_dir: Path):
             p_l = np.pad(p_l, (center_pad, center_pad), mode='reflect')
             p_r = np.pad(p_r, (center_pad, center_pad), mode='reflect')
 
-            w = torch.hann_window(fft_size)
             tl = torch.from_numpy(p_l)
             tr = torch.from_numpy(p_r)
 
-            stft_l = torch.stft(tl, fft_size, hop_length=hop_size, window=w, return_complex=True)
-            stft_r = torch.stft(tr, fft_size, hop_length=hop_size, window=w, return_complex=True)
+            stft_l = torch.stft(tl, fft_size, hop_length=hop_size, window=window_hann, return_complex=True)
+            stft_r = torch.stft(tr, fft_size, hop_length=hop_size, window=window_hann, return_complex=True)
             scale = 1.0 / np.sqrt(fft_size)
 
             spec_l = stft_l[:, 2:2+336] * scale
@@ -618,9 +638,55 @@ def run_server_demucs_separation(audio_path: Path, output_dir: Path):
             mag_spec[0, 3] = spec_r.imag[:2048, :336].numpy()
             feeds[input_names[1]] = mag_spec
 
-        infer_out = session.run(None, feeds)
-        out_audio = infer_out[0][0]
+        infer_results = session.run(None, feeds)
 
+        # Поиск временного выхода формы [1, 4, 2, 343980] или [4, 2, 343980]
+        time_data = None
+        freq_data = None
+
+        for res_idx, tensor in enumerate(infer_results):
+            shape = tensor.shape
+            # Временной домен: 4 трека, 2 канала, S сэмплов
+            if len(shape) == 4 and shape[1] == 4 and shape[2] == 2:
+                time_data = tensor[0] # [4, 2, S]
+            elif len(shape) == 3 and shape[0] == 4 and shape[1] == 2:
+                time_data = tensor
+            # Частотный домен: маска спектрограммы [1, 4, 4, B, F]
+            elif (len(shape) == 5 and shape[1] == 4 and shape[2] == 4) or (len(shape) == 4 and shape[0] == 4 and shape[1] == 4):
+                freq_data = tensor[0] if len(shape) == 5 else tensor
+
+        if time_data is None:
+            # Если прямой time_data не найден, берём первый совместимый тензор
+            for tensor in infer_results:
+                if tensor.ndim >= 3 and tensor.shape[-1] >= training_samples:
+                    time_data = tensor.reshape(4, 2, -1)
+                    break
+
+        if time_data is None:
+            raise RuntimeError("Не удалось извлечь временные аудиосигналы из модели Demucs")
+
+        # Применяем iSTFT к частотной маске, если она присутствует
+        if freq_data is not None:
+            for t in range(4):
+                try:
+                    # Частотная ветка Demucs (восстановление звука через istft)
+                    spec_ch0 = torch.complex(torch.from_numpy(freq_data[t, 0]), torch.from_numpy(freq_data[t, 1]))
+                    spec_ch1 = torch.complex(torch.from_numpy(freq_data[t, 2]), torch.from_numpy(freq_data[t, 3]))
+
+                    full_spec_l = torch.zeros((2049, 340), dtype=torch.complex64)
+                    full_spec_r = torch.zeros((2049, 340), dtype=torch.complex64)
+                    full_spec_l[:2048, 2:338] = spec_ch0
+                    full_spec_r[:2048, 2:338] = spec_ch1
+
+                    istft_l = torch.istft(full_spec_l, fft_size, hop_length=hop_size, window=window_hann, length=training_samples) * np.sqrt(fft_size)
+                    istft_r = torch.istft(full_spec_r, fft_size, hop_length=hop_size, window=window_hann, length=training_samples) * np.sqrt(fft_size)
+
+                    time_data[t, 0] += istft_l.numpy()
+                    time_data[t, 1] += istft_r.numpy()
+                except Exception:
+                    pass
+
+        # Окно наложения
         window = np.ones(seg_len, dtype=np.float32)
         if fade_len > 0:
             fade_in = np.minimum(np.arange(seg_len) / fade_len, 1.0)
@@ -628,7 +694,7 @@ def run_server_demucs_separation(audio_path: Path, output_dir: Path):
             window = np.minimum(fade_in, fade_out)
 
         for t in range(4):
-            outputs[t][:, start:end] += out_audio[t, :, :seg_len] * window
+            outputs[t][:, start:end] += time_data[t, :, :seg_len] * window
         weights[start:end] += window
 
     weights = np.maximum(weights, 1e-8)
