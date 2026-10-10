@@ -522,12 +522,22 @@ def get_server_demucs_session():
     global DEMUCS_SESSION
     if DEMUCS_SESSION is None:
         import onnxruntime as ort
-        # Ищем модель в demucs-web или demucs-web-collab
+        import urllib.request
+        
+        # 1. Проверяем локальные папки репозитория
         model_path = BASE_DIR / "demucs-web" / "htdemucs_embedded.onnx"
         if not model_path.exists():
             model_path = BASE_DIR / "demucs-web-collab" / "htdemucs_embedded.onnx"
+            
+        # 2. Если файл отсутствует — скачиваем веса в кэш моделей
         if not model_path.exists():
-            raise FileNotFoundError(f"Файл ONNX модели Demucs не найден в папках demucs-web/demucs-web-collab")
+            cache_model_path = MODELS_CACHE_DIR / "htdemucs_embedded.onnx"
+            if not cache_model_path.exists():
+                print("[Demucs GPU] Скачивание модели htdemucs_embedded.onnx (~172MB)...")
+                model_url = "https://huggingface.co/timcsy/demucs-web-onnx/resolve/main/htdemucs_embedded.onnx"
+                urllib.request.urlretrieve(model_url, str(cache_model_path))
+                print("[Demucs GPU] Модель успешно загружена!")
+            model_path = cache_model_path
 
         providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
         sess_opt = ort.SessionOptions()
